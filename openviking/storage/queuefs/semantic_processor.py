@@ -186,6 +186,21 @@ class SemanticProcessor(DequeueHandlerBase):
         # Default to other
         return FILE_TYPE_OTHER
 
+    async def _uri_is_directory(self, uri: str, ctx: Optional[RequestContext] = None) -> bool:
+        """Return True only when the target URI currently exists as a directory."""
+        try:
+            stat = await get_viking_fs().stat(uri, ctx=ctx)
+        except Exception:
+            return False
+
+        if stat.get("isDir") is not None:
+            return bool(stat.get("isDir"))
+        if stat.get("is_dir") is not None:
+            return bool(stat.get("is_dir"))
+        if stat.get("type") is not None:
+            return stat.get("type") == "directory"
+        return False
+
     async def _check_file_content_changed(
         self, file_path: str, target_file: str, ctx: Optional[RequestContext] = None
     ) -> bool:
@@ -228,12 +243,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     await self._process_memory_directory(msg)
                 else:
                     is_incremental = False
-                    viking_fs = get_viking_fs()
                     if msg.target_uri:
-                        target_exists = await viking_fs.exists(
-                            msg.target_uri, ctx=self._current_ctx
-                        )
-                        if target_exists:
+                        if await self._uri_is_directory(msg.target_uri, ctx=self._current_ctx):
                             is_incremental = True
                             logger.info(
                                 f"Target URI exists, using incremental update: {msg.target_uri}"
@@ -528,8 +539,15 @@ class SemanticProcessor(DequeueHandlerBase):
                 if root_subdir and target_subdir:
                     await sync_dir(root_subdir, target_subdir)
 
-        target_exists = await viking_fs.exists(target_uri, ctx=ctx)
-        if not target_exists:
+        target_is_dir = await self._uri_is_directory(target_uri, ctx=ctx)
+        if not target_is_dir:
+            if await viking_fs.exists(target_uri, ctx=ctx):
+                try:
+                    await viking_fs.rm(target_uri, recursive=True, ctx=ctx)
+                except Exception as e:
+                    logger.error(
+                        f"[SyncDiff] Failed to remove non-directory target {target_uri}: {e}"
+                    )
             parent_uri = VikingURI(target_uri).parent
             if parent_uri:
                 await viking_fs.mkdir(parent_uri.uri, exist_ok=True, ctx=ctx)
