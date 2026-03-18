@@ -18,7 +18,7 @@ from vikingbot.agent.tools.registry import ToolRegistry
 from vikingbot.bus.events import InboundMessage, OutboundEventType, OutboundMessage
 from vikingbot.bus.queue import MessageBus
 from vikingbot.config import load_config
-from vikingbot.config.schema import Config, SessionKey
+from vikingbot.config.schema import BotMode, Config, SessionKey
 from vikingbot.hooks import HookContext
 from vikingbot.hooks.manager import hook_manager
 from vikingbot.providers.base import LLMProvider
@@ -425,6 +425,14 @@ class AgentLoop:
             preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
             logger.info(f"Processing message from {msg.session_key}:{msg.sender_id}: {preview}")
 
+            # Debug mode handling
+            if self.config.mode == BotMode.DEBUG:
+                # In debug mode, only record message to session, no processing or reply
+                session = self.sessions.get_or_create(msg.session_key)
+                session.add_message("user", msg.content, sender_id=msg.sender_id)
+                await self.sessions.save(session)
+                return None
+
             # Get or create session
             session_key = msg.session_key
             # For CLI/direct sessions, skip heartbeat by default
@@ -447,10 +455,28 @@ class AgentLoop:
                 return OutboundMessage(
                     session_key=msg.session_key, content="🐈 New session started. Memory consolidated.", metadata=msg.metadata
                 )
+            if cmd == "/remember":
+                # Check if sender is allowed in current channel
+                channel_config = None
+                for channel in self.config.channels_config.get_all_channels():
+                    if channel.channel_key() == msg.session_key.channel_key():
+                        channel_config = channel
+                        break
+
+                # If channel not found or sender not in allow_from list, ignore message
+                if not channel_config or msg.sender_id not in channel_config.allow_from:
+                    return None
+                session_clone = session.clone()
+                session.clear()
+                await self.sessions.save(session)
+                await self._consolidate_viking_memory(session_clone)
+                return OutboundMessage(
+                    session_key=msg.session_key, content="This conversation has been submitted to memory storage.", metadata=msg.metadata
+                )
             if cmd == "/help":
                 return OutboundMessage(
                     session_key=msg.session_key,
-                    content="🐈 vikingbot commands:\n/new — Start a new conversation\n/help — Show available commands",
+                    content="🐈 vikingbot commands:\n/new — Start a new conversation\n/remember — Submit current session to memories and start new session\n/help — Show available commands",
                     metadata=msg.metadata
                 )
 
@@ -566,15 +592,7 @@ class AgentLoop:
                 return
 
             # use openviking tools to extract memory
-            await hook_manager.execute_hooks(
-                context=HookContext(
-                    event_type="message.compact",
-                    session_id=session.key.safe_name(),
-                    workspace_id=self.sandbox_manager.to_workspace_id(session.key),
-                    session_key=session.key,
-                ),
-                session=session,
-            )
+            await self._consolidate_viking_memory(session)
 
             if self.sandbox_manager:
                 memory_workspace = self.sandbox_manager.get_workspace_path(session.key)
@@ -652,6 +670,25 @@ Respond with ONLY valid JSON, no markdown fences."""
             # Session trimming and saving is handled by the caller before calling _consolidate_memory
             # This method works on a cloned session, so no need to save it
             logger.info("Memory consolidation done")
+        except Exception as e:
+            logger.exception(f"Memory consolidation failed: {e}")
+
+    async def _consolidate_viking_memory(self, session) -> None:
+        """Consolidate old messages into MEMORY.md + HISTORY.md. Works on a cloned session."""
+        try:
+            if not session.messages:
+                return
+
+            # use openviking tools to extract memory
+            await hook_manager.execute_hooks(
+                context=HookContext(
+                    event_type="message.compact",
+                    session_id=session.key.safe_name(),
+                    workspace_id=self.sandbox_manager.to_workspace_id(session.key),
+                    session_key=session.key,
+                ),
+                session=session,
+            )
         except Exception as e:
             logger.exception(f"Memory consolidation failed: {e}")
 
