@@ -1737,6 +1737,7 @@ function bindAddResource() {
           upload: uploadPayload.result,
           add_resource: addPayload.result,
         },
+        telemetry: addPayload.telemetry,
       });
     } catch (error) {
       setOutput(error.message);
