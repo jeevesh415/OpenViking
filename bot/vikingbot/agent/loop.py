@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,7 +19,7 @@ from vikingbot.agent.tools.registry import ToolRegistry
 from vikingbot.bus.events import InboundMessage, OutboundEventType, OutboundMessage
 from vikingbot.bus.queue import MessageBus
 from vikingbot.config import load_config
-from vikingbot.config.schema import Config, SessionKey
+from vikingbot.config.schema import BotMode, Config, SessionKey
 from vikingbot.hooks import HookContext
 from vikingbot.hooks.manager import hook_manager
 from vikingbot.providers.base import LLMProvider
@@ -61,6 +62,7 @@ class AgentLoop:
         sandbox_manager: SandboxManager | None = None,
         config: Config = None,
         eval: bool = False,
+        mcp_servers: dict | None = None,
     ):
         """
         Initialize the AgentLoop with all required dependencies and configuration.
@@ -128,7 +130,47 @@ class AgentLoop:
         )
 
         self._running = False
+        self._mcp_servers = mcp_servers or {}
+        self._mcp_stack: AsyncExitStack | None = None
+        self._mcp_connected = False
+        self._mcp_connecting = False
         self._register_default_tools()
+
+    async def _connect_mcp(self) -> None:
+        """Connect to configured MCP servers (one-time, lazy, retryable on failure).
+
+        Ported from HKUDS/nanobot v0.1.5.
+        """
+        if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
+            return
+        self._mcp_connecting = True
+        try:
+            from vikingbot.agent.tools.mcp import connect_mcp_servers
+
+            self._mcp_stack = AsyncExitStack()
+            await self._mcp_stack.__aenter__()
+            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+            self._mcp_connected = True
+        except Exception as e:
+            logger.error(f"Failed to connect MCP servers (will retry next message): {e}")
+            if self._mcp_stack:
+                try:
+                    await self._mcp_stack.aclose()
+                except Exception:
+                    pass
+                self._mcp_stack = None
+        finally:
+            self._mcp_connecting = False
+
+    async def close_mcp(self) -> None:
+        """Close MCP server connections. Ported from HKUDS/nanobot v0.1.5."""
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            except (RuntimeError, BaseExceptionGroup):
+                pass  # MCP SDK cancel scope cleanup is noisy but harmless
+            self._mcp_stack = None
+        self._mcp_connected = False
 
     async def _publish_thinking_event(
         self, session_key: SessionKey, event_type: OutboundEventType, content: str
@@ -181,6 +223,7 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
+        await self._connect_mcp()
         logger.info("Agent loop started")
 
         while self._running:
@@ -200,6 +243,7 @@ class AgentLoop:
                         OutboundMessage(
                             session_key=msg.session_key,
                             content=f"Sorry, I encountered an error: {str(e)}",
+                            metadata=msg.metadata,
                         )
                     )
             except asyncio.TimeoutError:
@@ -216,7 +260,8 @@ class AgentLoop:
         session_key: SessionKey,
         publish_events: bool = True,
         sender_id: str | None = None,
-    ) -> tuple[str | None, list[dict], dict[str, int]]:
+        ov_tools_enable: bool = True,
+    ) -> tuple[str | None, list[dict], dict[str, int], int]:
         """
         Run the core agent loop: call LLM, execute tools, repeat until done.
 
@@ -224,6 +269,7 @@ class AgentLoop:
             messages: Initial message list
             session_key: Session key for tool execution context
             publish_events: Whether to publish ITERATION/REASONING/TOOL_CALL events to the bus
+            ov_tools_enable: Whether to enable OpenViking tools for this session
 
         Returns:
             tuple of (final_content, tools_used)
@@ -251,7 +297,7 @@ class AgentLoop:
 
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=self.tools.get_definitions(ov_tools_enable=ov_tools_enable),
                 model=self.model,
                 session_id=session_key.safe_name(),
             )
@@ -350,19 +396,21 @@ class AgentLoop:
                     tools_used.append(tool_used_dict)
 
                 messages.append(
-                    {"role": "system", "content": "Reflect on the results and decide next steps."}
+                    {"role": "user", "content": "Reflect on the results and decide next steps."}
                 )
             else:
                 final_content = response.content
                 break
 
-        if final_content is None:
+        if final_content is None or (
+            isinstance(final_content, str) and not final_content.strip()
+        ):
             if iteration >= self.max_iterations:
                 final_content = f"Reached {self.max_iterations} iterations without completion."
             else:
                 final_content = "I've completed processing but have no response to give."
 
-        return final_content, tools_used, token_usage
+        return final_content, tools_used, token_usage, iteration
 
     @trace(
         name="process_message",
@@ -393,7 +441,7 @@ class AgentLoop:
             max_ticks = 7
 
             while not long_running_notified and tick_count < max_ticks:
-                await asyncio.sleep(40)
+                await asyncio.sleep(60)
                 if long_running_notified:
                     break
                 if msg.metadata:
@@ -425,7 +473,6 @@ class AgentLoop:
             preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
             logger.info(f"Processing message from {msg.session_key}:{msg.sender_id}: {preview}")
 
-            # Get or create session
             session_key = msg.session_key
             # For CLI/direct sessions, skip heartbeat by default
             skip_heartbeat = session_key.type == "cli"
@@ -439,6 +486,23 @@ class AgentLoop:
                 cmd = msg.content.strip().lower()
             if cmd == "/new":
                 # Clone session for async consolidation, then immediately clear original
+                if not self._check_cmd_auth(msg):
+                    return OutboundMessage(
+                        session_key=msg.session_key, content="🐈 Sorry, you are not authorized to use this command.",
+                        metadata=msg.metadata
+                    )
+                session.clear()
+                await self.sessions.save(session)
+                return OutboundMessage(
+                    session_key=msg.session_key, content="🐈 New session started. Session history droped.", metadata=msg.metadata
+                )
+            elif cmd == "/compact":
+                # Clone session for async consolidation, then immediately clear original
+                if not self._check_cmd_auth(msg):
+                    return OutboundMessage(
+                        session_key=msg.session_key, content="🐈 Sorry, you are not authorized to use this command.",
+                        metadata=msg.metadata
+                    )
                 session_clone = session.clone()
                 session.clear()
                 await self.sessions.save(session)
@@ -447,11 +511,39 @@ class AgentLoop:
                 return OutboundMessage(
                     session_key=msg.session_key, content="🐈 New session started. Memory consolidated.", metadata=msg.metadata
                 )
+            if cmd == "/remember":
+                if not self._check_cmd_auth(msg):
+                    return OutboundMessage(
+                        session_key=msg.session_key, content="🐈 Sorry, you are not authorized to use this command.",
+                        metadata=msg.metadata
+                    )
+                session_clone = session.clone()
+                await self._consolidate_viking_memory(session_clone)
+                return OutboundMessage(
+                    session_key=msg.session_key, content="This conversation has been submitted to memory storage.", metadata=msg.metadata
+                )
             if cmd == "/help":
                 return OutboundMessage(
                     session_key=msg.session_key,
-                    content="🐈 vikingbot commands:\n/new — Start a new conversation\n/help — Show available commands",
+                    content="🐈 vikingbot commands:\n/new — Start a new conversation\n/remember — Submit current session to memories and start new session\n/help — Show available commands",
                     metadata=msg.metadata
+                )
+
+            # Debug mode handling
+            if self.config.mode == BotMode.DEBUG:
+                # In debug mode, only record message to session, no processing or reply
+                session.add_message("user", msg.content, sender_id=msg.sender_id)
+                await self.sessions.save(session)
+                return None
+
+            if not msg.need_reply:
+                session.add_message("user", msg.content, sender_id=msg.sender_id)
+                await self.sessions.save(session)
+                return OutboundMessage(
+                    session_key=msg.session_key,
+                    content="",
+                    metadata=msg.metadata,
+                    event_type=OutboundEventType.NO_REPLY,
                 )
 
             # Consolidate memory before processing if session is too large
@@ -479,21 +571,24 @@ class AgentLoop:
                 eval=self._eval,
             )
 
+            ov_tools_enable = self._get_ov_tools_enable(session_key)
             # Build initial messages (use get_history for LLM-formatted messages)
             messages = await message_context.build_messages(
                 history=session.get_history(),
                 current_message=msg.content,
                 media=msg.media if msg.media else None,
                 session_key=msg.session_key,
+                ov_tools_enable=ov_tools_enable,
             )
-            # logger.info(f"New messages: {messages}")
+            logger.info(f"New messages: {messages}")
 
             # Run agent loop
-            final_content, tools_used, token_usage = await self._run_agent_loop(
+            final_content, tools_used, token_usage, iteration = await self._run_agent_loop(
                 messages=messages,
                 session_key=session_key,
                 publish_events=True,
                 sender_id=msg.sender_id,
+                ov_tools_enable=ov_tools_enable,
             )
 
             # Log response preview
@@ -509,13 +604,18 @@ class AgentLoop:
             await self.sessions.save(session)
 
             time_cost = round(time.time() - start_time, 2)
+            if tools_used is not None:
+                tools_used_names = [tool["tool_name"] for tool in tools_used]
+            else:
+                tools_used_names = []
             return OutboundMessage(
                 session_key=msg.session_key,
                 content=final_content,
                 metadata=msg.metadata,
                 token_usage=token_usage,
-                time_cost=time_cost
-                or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+                time_cost=time_cost,
+                iteration=iteration,
+                tools_used_names=tools_used_names
             )
         finally:
             long_running_notified = True
@@ -524,6 +624,29 @@ class AgentLoop:
                 await monitor_task
             except asyncio.CancelledError:
                 pass
+
+    def _get_channel_config(self, session_key: SessionKey):
+        """Get channel config for a session key.
+
+        Args:
+            session_key: Session key to get channel config for
+
+        Returns:
+            Channel config object if found, None otherwise
+        """
+        return self.config.channels_config.get_channel_by_key(session_key.channel_key())
+
+    def _get_ov_tools_enable(self, session_key: SessionKey) -> bool:
+        """Get ov_tools_enable setting from channel config.
+
+        Args:
+            session_key: Session key to get channel config for
+
+        Returns:
+            True if ov tools should be enabled, False otherwise
+        """
+        channel_config = self._get_channel_config(session_key)
+        return getattr(channel_config, "ov_tools_enable", True) if channel_config else True
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
@@ -537,18 +660,28 @@ class AgentLoop:
         session = self.sessions.get_or_create(msg.session_key)
 
         # Build messages with the announce content
+        ov_tools_enable = self._get_ov_tools_enable(msg.session_key)
         messages = await self.context.build_messages(
-            history=session.get_history(), current_message=msg.content, session_key=msg.session_key
+            history=session.get_history(),
+            current_message=msg.content,
+            session_key=msg.session_key,
+            ov_tools_enable=ov_tools_enable,
         )
 
+        # Check channel config for ov_tools_enable setting
+        ov_tools_enable = self._get_ov_tools_enable(msg.session_key)
+
         # Run agent loop (no events published)
-        final_content, tools_used, token_usage = await self._run_agent_loop(
+        final_content, tools_used, token_usage, iteration = await self._run_agent_loop(
             messages=messages,
             session_key=msg.session_key,
             publish_events=False,
+            ov_tools_enable=ov_tools_enable,
         )
 
-        if final_content is None:
+        if final_content is None or (
+            isinstance(final_content, str) and not final_content.strip()
+        ):
             final_content = "Background task completed."
 
         # Save to session (mark as system message in history)
@@ -567,15 +700,18 @@ class AgentLoop:
                 return
 
             # use openviking tools to extract memory
-            await hook_manager.execute_hooks(
-                context=HookContext(
-                    event_type="message.compact",
-                    session_id=session.key.safe_name(),
-                    workspace_id=self.sandbox_manager.to_workspace_id(session.key),
-                    session_key=session.key,
-                ),
-                session=session,
-            )
+            config = self.config
+            if config.mode == BotMode.READONLY:
+                if not config.channels_config or not config.channels_config.get_all_channels():
+                    return
+                allow_from = [config.ov_server.admin_user_id]
+                for channel_config in config.channels_config.get_all_channels():
+                    if channel_config and channel_config.type.value == session.key.type:
+                        if hasattr(channel_config, "allow_from"):
+                            allow_from.extend(channel_config.allow_from)
+                messages = [msg for msg in session.messages if msg.get("sender_id") in allow_from]
+                session.messages = messages
+            await self._consolidate_viking_memory(session)
 
             if self.sandbox_manager:
                 memory_workspace = self.sandbox_manager.get_workspace_path(session.key)
@@ -656,12 +792,57 @@ Respond with ONLY valid JSON, no markdown fences."""
         except Exception as e:
             logger.exception(f"Memory consolidation failed: {e}")
 
+    async def _consolidate_viking_memory(self, session) -> None:
+        """Consolidate old messages into MEMORY.md + HISTORY.md. Works on a cloned session."""
+        try:
+            if not session.messages:
+                logger.info(f"No messages to commit openviking for session {session.key.safe_name()} (allow_from filter applied)")
+                return
+
+            # use openviking tools to extract memory
+            await hook_manager.execute_hooks(
+                context=HookContext(
+                    event_type="message.compact",
+                    session_id=session.key.safe_name(),
+                    workspace_id=self.sandbox_manager.to_workspace_id(session.key),
+                    session_key=session.key,
+                ),
+                session=session,
+            )
+        except Exception as e:
+            logger.exception(f"Memory consolidation failed: {e}")
+
     async def _safe_consolidate_memory(self, session, archive_all: bool = False) -> None:
         """Safe wrapper for _consolidate_memory that ensures all exceptions are caught."""
         try:
             await self._consolidate_memory(session, archive_all)
         except Exception as e:
             logger.exception(f"Background memory consolidation task failed: {e}")
+
+    def _check_cmd_auth(self, msg: InboundMessage) -> bool:
+        """Check if the session key is authorized for command execution.
+
+        Returns:
+            True if authorized, False otherwise.
+        Args:
+            session_key: Session key to check.
+        """
+        if self.config.mode == BotMode.NORMAL:
+            return True
+        allow_from = []
+        if self.config.ov_server and self.config.ov_server.admin_user_id:
+            allow_from.append(self.config.ov_server.admin_user_id)
+        channel_config = self._get_channel_config(msg.session_key)
+        if channel_config:
+            allow_cmd = getattr(channel_config, 'allow_cmd_from', [])
+            if allow_cmd:
+                allow_from.extend(allow_cmd)
+
+        # If channel not found or sender not in allow_from list, ignore message
+        if msg.sender_id not in allow_from:
+            logger.debug(f"Sender {msg.sender_id} not allowed in channel {msg.session_key.channel_key()}")
+            return False
+        return True
 
     async def process_direct(
         self,
@@ -678,6 +859,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         Returns:
             The agent's response.
         """
+        await self._connect_mcp()
         msg = InboundMessage(session_key=session_key, sender_id="user", content=content)
 
         response = await self._process_message(msg)

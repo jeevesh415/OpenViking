@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """PID-based advisory lock for data directory exclusivity.
 
 Prevents multiple OpenViking processes from contending for the same data
@@ -9,6 +9,7 @@ directory, which causes silent failures in AGFS and VectorDB.
 import atexit
 import os
 import signal
+import sys
 
 from openviking_cli.utils import get_logger
 
@@ -36,12 +37,36 @@ def _is_pid_alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         # Process exists but we can't signal it.
-        return True
+        pass
+    except (OSError, SystemError):
+        if sys.platform == "win32":
+            return False
+        raise
+
+    # PID exists, but on Linux PIDs are recycled. Verify this is actually
+    # an OpenViking process by checking /proc/{pid}/cmdline to avoid false
+    # positives from PID reuse (see issue #1088).
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace").lower()
+            if "openviking" not in cmdline and "openviking-server" not in cmdline:
+                logger.info(
+                    "PID %d is alive but not an OpenViking process (cmdline: %.100s). "
+                    "Assuming stale lock from recycled PID.",
+                    pid,
+                    cmdline[:100],
+                )
+                return False
+        except OSError:
+            # /proc not available or process exited between kill and open
+            pass
+
+    return True
 
 
 def acquire_data_dir_lock(data_dir: str) -> str:

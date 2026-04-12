@@ -142,7 +142,7 @@ function isEventMemory(item: FindResultItem): boolean {
 }
 
 function isLeafLikeMemory(item: FindResultItem): boolean {
-  return item.level === 2 || item.uri.endsWith(".md");
+  return item.level === 2;
 }
 
 const PREFERENCE_QUERY_RE = /prefer|preference|favorite|favourite|like|偏好|喜欢|爱好|更倾向/i;
@@ -222,6 +222,7 @@ export function pickMemoriesForInjection(
   items: FindResultItem[],
   limit: number,
   queryText: string,
+  scoreThreshold: number = 0,
 ): FindResultItem[] {
   if (items.length === 0 || limit <= 0) {
     return [];
@@ -252,6 +253,12 @@ export function pickMemoriesForInjection(
       break;
     }
     if (used.has(item.uri)) {
+      continue;
+    }
+    // Respect score threshold when supplementing leaf memories with
+    // non-leaf items. Without this check, low-scoring memories bypass
+    // the threshold configured in recallScoreThreshold (see #1106).
+    if (clampScore(item.score) < scoreThreshold) {
       continue;
     }
     picked.push(item);

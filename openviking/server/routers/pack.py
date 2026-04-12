@@ -1,16 +1,21 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """Pack endpoints for OpenViking HTTP Server."""
 
-from typing import Optional
+import os
+import tempfile
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict
+from starlette.background import BackgroundTask
 
 from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
+from openviking.server.local_input_guard import resolve_uploaded_temp_file_id
 from openviking.server.models import Response
+from openviking_cli.utils.config.open_viking_config import get_openviking_config
 
 router = APIRouter(prefix="/api/v1/pack", tags=["pack"])
 
@@ -19,14 +24,21 @@ class ExportRequest(BaseModel):
     """Request model for export."""
 
     uri: str
-    to: str
 
 
 class ImportRequest(BaseModel):
-    """Request model for import."""
+    """Request model for import.
 
-    file_path: Optional[str] = None
-    temp_path: Optional[str] = None
+    Attributes:
+        temp_file_id: Temporary upload id returned by /api/v1/resources/temp_upload.
+        parent: Parent URI under which the imported pack will be placed.
+        force: Whether to overwrite existing content if needed.
+        vectorize: Whether to build vectors for imported content.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    temp_file_id: str
     parent: str
     force: bool = False
     vectorize: bool = True
@@ -37,10 +49,40 @@ async def export_ovpack(
     request: ExportRequest,
     _ctx: RequestContext = Depends(get_request_context),
 ):
-    """Export context as .ovpack file."""
+    """Export context as .ovpack file and stream it to client."""
     service = get_service()
-    result = await service.pack.export_ovpack(request.uri, request.to, ctx=_ctx)
-    return Response(status="ok", result={"file": result})
+
+    # Create temp file for export
+    temp_dir = tempfile.gettempdir()
+    temp_file = os.path.join(temp_dir, f"export_{os.urandom(16).hex()}.ovpack")
+
+    try:
+        # Export to temp file
+        await service.pack.export_ovpack(request.uri, temp_file, ctx=_ctx)
+
+        # Determine filename from URI
+        base_name = request.uri.strip().rstrip("/").split("/")[-1]
+        if not base_name:
+            base_name = "export"
+        filename = f"{base_name}.ovpack"
+
+        # Create background task for cleanup
+        def cleanup():
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+
+        # Stream file back to client with cleanup
+        return FileResponse(
+            path=temp_file,
+            media_type="application/zip",
+            filename=filename,
+            background=BackgroundTask(cleanup),
+        )
+    except Exception:
+        # Clean up temp file on error
+        if os.path.exists(temp_file):
+            os.unlink(temp_file)
+        raise
 
 
 @router.post("/import")
@@ -51,9 +93,8 @@ async def import_ovpack(
     """Import .ovpack file."""
     service = get_service()
 
-    file_path = request.file_path
-    if request.temp_path:
-        file_path = request.temp_path
+    upload_temp_dir = get_openviking_config().storage.get_upload_temp_dir()
+    file_path = resolve_uploaded_temp_file_id(request.temp_file_id, upload_temp_dir)
 
     result = await service.pack.import_ovpack(
         file_path,

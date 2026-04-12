@@ -1,20 +1,24 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 
 """Tests for resource management endpoints."""
 
-from types import SimpleNamespace
+import zipfile
 
 import httpx
 
 from openviking.telemetry import get_current_telemetry
 
 
-async def test_add_resource_success(client: httpx.AsyncClient, sample_markdown_file):
+async def test_add_resource_success(
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
+):
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": str(sample_markdown_file),
+            "temp_file_id": sample_markdown_file.name,
             "reason": "test resource",
             "wait": False,
         },
@@ -29,11 +33,15 @@ async def test_add_resource_success(client: httpx.AsyncClient, sample_markdown_f
     assert body["result"]["root_uri"].startswith("viking://")
 
 
-async def test_add_resource_with_wait(client: httpx.AsyncClient, sample_markdown_file):
+async def test_add_resource_with_wait(
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
+):
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": str(sample_markdown_file),
+            "temp_file_id": sample_markdown_file.name,
             "reason": "test resource",
             "wait": True,
         },
@@ -44,11 +52,15 @@ async def test_add_resource_with_wait(client: httpx.AsyncClient, sample_markdown
     assert "root_uri" in body["result"]
 
 
-async def test_add_resource_with_telemetry_wait(client: httpx.AsyncClient, sample_markdown_file):
+async def test_add_resource_with_telemetry_wait(
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
+):
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": str(sample_markdown_file),
+            "temp_file_id": sample_markdown_file.name,
             "reason": "telemetry resource",
             "wait": True,
             "telemetry": True,
@@ -63,14 +75,17 @@ async def test_add_resource_with_telemetry_wait(client: httpx.AsyncClient, sampl
     semantic = telemetry_summary.get("semantic_nodes")
     if semantic is not None:
         assert semantic["total"] is None or semantic["done"] == semantic["total"]
-        assert semantic["pending"] in (None, 0)
-        assert semantic["running"] in (None, 0)
+        assert semantic.get("pending") in (None, 0)
+        assert semantic.get("running") in (None, 0)
     assert "resource" in telemetry_summary
     assert "memory" not in telemetry_summary
 
 
 async def test_add_resource_with_telemetry_includes_resource_breakdown(
-    client: httpx.AsyncClient, service, monkeypatch
+    client: httpx.AsyncClient,
+    service,
+    monkeypatch,
+    upload_temp_dir,
 ):
     async def fake_add_resource(**kwargs):
         telemetry = get_current_telemetry()
@@ -93,10 +108,13 @@ async def test_add_resource_with_telemetry_includes_resource_breakdown(
 
     monkeypatch.setattr(service.resources, "add_resource", fake_add_resource)
 
+    demo_file = upload_temp_dir / "demo.md"
+    demo_file.write_text("# demo\n")
+
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": "/tmp/demo.md",
+            "temp_file_id": demo_file.name,
             "reason": "telemetry resource",
             "wait": True,
             "telemetry": True,
@@ -117,12 +135,14 @@ async def test_add_resource_with_telemetry_includes_resource_breakdown(
 
 
 async def test_add_resource_with_summary_only_telemetry(
-    client: httpx.AsyncClient, sample_markdown_file
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
 ):
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": str(sample_markdown_file),
+            "temp_file_id": sample_markdown_file.name,
             "reason": "summary only telemetry resource",
             "wait": True,
             "telemetry": {"summary": True},
@@ -139,12 +159,14 @@ async def test_add_resource_with_summary_only_telemetry(
 
 
 async def test_add_resource_rejects_events_only_telemetry(
-    client: httpx.AsyncClient, sample_markdown_file
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
 ):
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": str(sample_markdown_file),
+            "temp_file_id": sample_markdown_file.name,
             "reason": "events only telemetry",
             "wait": False,
             "telemetry": {"summary": False, "events": True},
@@ -162,17 +184,21 @@ async def test_add_resource_file_not_found(client: httpx.AsyncClient):
         "/api/v1/resources",
         json={"path": "/nonexistent/file.txt", "reason": "test"},
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 403
     body = resp.json()
-    assert body["status"] == "ok"
-    assert "errors" in body["result"] and len(body["result"]["errors"]) > 0
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "PERMISSION_DENIED"
 
 
-async def test_add_resource_with_to(client: httpx.AsyncClient, sample_markdown_file):
+async def test_add_resource_with_to(
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
+):
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": str(sample_markdown_file),
+            "temp_file_id": sample_markdown_file.name,
             "to": "viking://resources/custom/sample",
             "reason": "test resource",
         },
@@ -181,6 +207,94 @@ async def test_add_resource_with_to(client: httpx.AsyncClient, sample_markdown_f
     body = resp.json()
     assert body["status"] == "ok"
     assert "custom" in body["result"]["root_uri"]
+
+
+async def test_add_resource_with_resources_root_to_uses_child_uri(
+    client: httpx.AsyncClient,
+    upload_temp_dir,
+):
+    archive_path = upload_temp_dir / "tt_b.zip"
+    with zipfile.ZipFile(archive_path, "w") as zf:
+        zf.writestr("tt_b/bb/readme.md", "# hello\n")
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "temp_file_id": archive_path.name,
+            "to": "viking://resources",
+            "reason": "test resource root import",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["result"]["root_uri"] == "viking://resources/tt_b"
+
+
+async def test_add_resource_with_resources_root_to_trailing_slash_uses_child_uri(
+    client: httpx.AsyncClient,
+    upload_temp_dir,
+):
+    archive_path = upload_temp_dir / "tt_b.zip"
+    with zipfile.ZipFile(archive_path, "w") as zf:
+        zf.writestr("tt_b/bb/readme.md", "# hello\n")
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "temp_file_id": archive_path.name,
+            "to": "viking://resources/",
+            "reason": "test resource root import trailing slash",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["result"]["root_uri"] == "viking://resources/tt_b"
+
+
+async def test_add_resource_with_resources_root_to_keeps_single_file_directory(
+    client: httpx.AsyncClient,
+    upload_temp_dir,
+):
+    file_path = upload_temp_dir / "upload_temp.txt"
+    file_path.write_text("hello world\n")
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "temp_file_id": file_path.name,
+            "source_name": "aa.txt",
+            "to": "viking://resources",
+            "reason": "test resource root file import",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["result"]["root_uri"] == "viking://resources/aa"
+
+
+async def test_add_resource_with_resources_root_to_trailing_slash_keeps_single_file_directory(
+    client: httpx.AsyncClient,
+    upload_temp_dir,
+):
+    file_path = upload_temp_dir / "upload_temp.txt"
+    file_path.write_text("hello world\n")
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "temp_file_id": file_path.name,
+            "source_name": "aa.txt",
+            "to": "viking://resources/",
+            "reason": "test resource root file import trailing slash",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["result"]["root_uri"] == "viking://resources/aa"
 
 
 async def test_wait_processed_empty_queue(client: httpx.AsyncClient):
@@ -193,10 +307,14 @@ async def test_wait_processed_empty_queue(client: httpx.AsyncClient):
     assert body["status"] == "ok"
 
 
-async def test_wait_processed_after_add(client: httpx.AsyncClient, sample_markdown_file):
+async def test_wait_processed_after_add(
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
+):
     await client.post(
         "/api/v1/resources",
-        json={"path": str(sample_markdown_file), "reason": "test"},
+        json={"temp_file_id": sample_markdown_file.name, "reason": "test"},
     )
     resp = await client.post(
         "/api/v1/system/wait",
@@ -207,12 +325,14 @@ async def test_wait_processed_after_add(client: httpx.AsyncClient, sample_markdo
 
 
 async def test_add_resource_with_watch_interval_requires_to(
-    client: httpx.AsyncClient, sample_markdown_file
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
 ):
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": str(sample_markdown_file),
+            "temp_file_id": sample_markdown_file.name,
             "reason": "test resource with watch interval",
             "watch_interval": 5.0,
         },
@@ -224,12 +344,14 @@ async def test_add_resource_with_watch_interval_requires_to(
 
 
 async def test_add_resource_with_default_watch_interval(
-    client: httpx.AsyncClient, sample_markdown_file
+    client: httpx.AsyncClient,
+    sample_markdown_file,
+    upload_temp_dir,
 ):
     resp = await client.post(
         "/api/v1/resources",
         json={
-            "path": str(sample_markdown_file),
+            "temp_file_id": sample_markdown_file.name,
             "reason": "test resource with default watch interval",
         },
     )
@@ -239,14 +361,7 @@ async def test_add_resource_with_default_watch_interval(
     assert "root_uri" in body["result"]
 
 
-async def test_temp_upload_success(client: httpx.AsyncClient, temp_dir, monkeypatch):
-    monkeypatch.setattr(
-        "openviking.server.routers.resources.get_openviking_config",
-        lambda: SimpleNamespace(
-            storage=SimpleNamespace(get_upload_temp_dir=lambda: temp_dir),
-        ),
-    )
-
+async def test_temp_upload_success(client: httpx.AsyncClient, upload_temp_dir):
     resp = await client.post(
         "/api/v1/resources/temp_upload",
         files={"file": ("sample.md", b"# upload\n", "text/markdown")},
@@ -255,19 +370,14 @@ async def test_temp_upload_success(client: httpx.AsyncClient, temp_dir, monkeypa
     body = resp.json()
     assert body["status"] == "ok"
     assert "telemetry" not in body
-    assert body["result"]["temp_path"].endswith(".md")
+    assert body["result"]["temp_file_id"].endswith(".md")
+    assert "/" not in body["result"]["temp_file_id"]
 
 
 async def test_temp_upload_with_telemetry_returns_summary(
-    client: httpx.AsyncClient, temp_dir, monkeypatch
+    client: httpx.AsyncClient,
+    upload_temp_dir,
 ):
-    monkeypatch.setattr(
-        "openviking.server.routers.resources.get_openviking_config",
-        lambda: SimpleNamespace(
-            storage=SimpleNamespace(get_upload_temp_dir=lambda: temp_dir),
-        ),
-    )
-
     resp = await client.post(
         "/api/v1/resources/temp_upload",
         files={"file": ("sample.md", b"# upload\n", "text/markdown")},
@@ -276,5 +386,74 @@ async def test_temp_upload_with_telemetry_returns_summary(
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert body["result"]["temp_path"].endswith(".md")
+    assert body["result"]["temp_file_id"].endswith(".md")
+    assert "/" not in body["result"]["temp_file_id"]
     assert body["telemetry"]["summary"]["operation"] == "resources.temp_upload"
+
+
+async def test_add_resource_rejects_direct_local_path(client: httpx.AsyncClient):
+    resp = await client.post(
+        "/api/v1/resources",
+        json={"path": "/app/ov.conf", "reason": "security test"},
+    )
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "PERMISSION_DENIED"
+
+
+async def test_add_resource_accepts_temp_uploaded_file(
+    client: httpx.AsyncClient,
+    upload_temp_dir,
+):
+    upload_resp = await client.post(
+        "/api/v1/resources/temp_upload",
+        files={"file": ("sample.md", b"# upload\n", "text/markdown")},
+    )
+    temp_file_id = upload_resp.json()["result"]["temp_file_id"]
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={"temp_file_id": temp_file_id, "reason": "uploaded resource"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["result"]["root_uri"].startswith("viking://")
+
+
+async def test_add_resource_rejects_temp_file_id_directory(
+    client: httpx.AsyncClient,
+    upload_temp_dir,
+):
+    temp_subdir = upload_temp_dir / "dir_upload"
+    temp_subdir.mkdir()
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={"temp_file_id": temp_subdir.name, "reason": "dir upload"},
+    )
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "PERMISSION_DENIED"
+
+
+async def test_add_resource_rejects_temp_file_id_symlink(
+    client: httpx.AsyncClient,
+    upload_temp_dir,
+    tmp_path,
+):
+    real_file = tmp_path / "outside.md"
+    real_file.write_text("# outside\n")
+    symlink_path = upload_temp_dir / "linked.md"
+    symlink_path.symlink_to(real_file)
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={"temp_file_id": symlink_path.name, "reason": "symlink upload"},
+    )
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "PERMISSION_DENIED"

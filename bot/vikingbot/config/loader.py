@@ -4,10 +4,13 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+
 from loguru import logger
+
 from vikingbot.config.schema import Config
 
 CONFIG_PATH = None
+
 
 def get_config_path() -> Path:
     """Get the path to ov.conf config file.
@@ -24,9 +27,7 @@ def _resolve_ov_conf_path() -> Path:
     # Check environment variable first
     env_path = os.environ.get("OPENVIKING_CONFIG_FILE")
     if env_path:
-        path = Path(env_path).expanduser()
-        if path.exists():
-            return path
+        return Path(env_path).expanduser()
 
     # Default path
     return Path.home() / ".openviking" / "ov.conf"
@@ -75,7 +76,13 @@ def load_config() -> Config:
     if path.exists():
         try:
             with open(path) as f:
-                full_data = json.load(f)
+                raw = f.read()
+
+            # Expand $VAR and ${VAR} inside the JSON text (useful for container deployments).
+            # Unset variables are left unchanged by expandvars().
+            raw = os.path.expandvars(raw)
+
+            full_data = json.loads(raw)
 
             # Extract bot section
             bot_data = full_data.get("bot", {})
@@ -122,7 +129,6 @@ def _merge_vlm_model_config(bot_data: dict, vlm_data: dict) -> None:
     if vlm_data.get("model"):
         if "agents" not in bot_data:
             bot_data["agents"] = {}
-        # Prepend provider prefix if provider is specified
         model = vlm_data["model"]
         provider = vlm_data.get("provider")
         if provider and "/" not in model:

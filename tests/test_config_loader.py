@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """Tests for config_loader utilities."""
 
 import pytest
@@ -84,6 +84,15 @@ class TestLoadJsonConfig:
         with pytest.raises(ValueError, match="Invalid JSON"):
             load_json_config(conf)
 
+    def test_expands_environment_variables(self, tmp_path, monkeypatch):
+        conf = tmp_path / "env.conf"
+        conf.write_text('{"api_key": "${TEST_API_KEY}"}')
+        monkeypatch.setenv("TEST_API_KEY", "sk-test-123")
+
+        data = load_json_config(conf)
+
+        assert data == {"api_key": "sk-test-123"}
+
 
 class TestRequireConfig:
     """Tests for require_config."""
@@ -98,3 +107,130 @@ class TestRequireConfig:
         monkeypatch.delenv("TEST_MISSING_ENV", raising=False)
         with pytest.raises(FileNotFoundError, match="configuration file not found"):
             require_config(None, "TEST_MISSING_ENV", "nonexistent_file.conf", "test")
+
+
+def test_openviking_config_rejects_unknown_nested_parser_section(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config.open_viking_config import (
+        OpenVikingConfig,
+        OpenVikingConfigSingleton,
+    )
+
+    with pytest.raises(ValueError, match="markdown"):
+        OpenVikingConfig.from_dict(
+            {
+                "embedding": {
+                    "dense": {
+                        "provider": "openai",
+                        "api_key": "test-key",
+                        "model": "text-embedding-3-small",
+                    }
+                },
+                "parsers": {"markdwon": {}},
+            }
+        )
+
+    OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_rejects_unknown_top_level_section_with_suggestion(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config.open_viking_config import (
+        OpenVikingConfig,
+        OpenVikingConfigSingleton,
+    )
+
+    with pytest.raises(
+        ValueError, match=r"Unknown config field 'erver' in OpenVikingConfig .*'server'"
+    ):
+        OpenVikingConfig.from_dict(
+            {
+                "erver": {
+                    "host": "127.0.0.1",
+                    "port": 1933,
+                    "root_api_key": "test",
+                    "cors_origins": ["*"],
+                },
+                "embedding": {
+                    "dense": {
+                        "provider": "openai",
+                        "api_key": "test-key",
+                        "model": "text-embedding-3-small",
+                    }
+                },
+            }
+        )
+
+    OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_singleton_preserves_value_error_for_bad_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+
+    config_path = tmp_path / "ov.conf"
+    config_path.write_text(
+        '{"erver": {"host": "127.0.0.1"}, "embedding": {"dense": {"provider": "openai", "api_key": "x", "model": "m"}}}'
+    )
+
+    OpenVikingConfigSingleton.reset_instance()
+    with pytest.raises(ValueError, match="server"):
+        OpenVikingConfigSingleton.initialize(config_path=str(config_path))
+    OpenVikingConfigSingleton.reset_instance()
+
+
+def test_require_config_missing_message_uses_openviking_ai_docs(tmp_path, monkeypatch):
+    import openviking_cli.utils.config.config_loader as loader
+
+    monkeypatch.delenv("TEST_MISSING_ENV", raising=False)
+    monkeypatch.setattr(loader, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(loader, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+
+    with pytest.raises(FileNotFoundError, match=r"https://openviking\.ai/docs"):
+        loader.require_config(None, "TEST_MISSING_ENV", "missing.conf", "test")
+
+
+def test_load_server_config_missing_message_uses_openviking_ai_docs(tmp_path, monkeypatch):
+    import openviking.server.config as server_config
+
+    monkeypatch.delenv("OPENVIKING_CONFIG_FILE", raising=False)
+    monkeypatch.setattr(server_config, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(server_config, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+
+    with pytest.raises(FileNotFoundError, match=r"https://openviking\.ai/docs"):
+        server_config.load_server_config()
+
+
+def test_openviking_config_singleton_missing_message_uses_openviking_ai_docs(tmp_path, monkeypatch):
+    import openviking_cli.utils.config.open_viking_config as config_module
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+
+    monkeypatch.delenv("OPENVIKING_CONFIG_FILE", raising=False)
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(config_module, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+
+    OpenVikingConfigSingleton.reset_instance()
+    try:
+        with pytest.raises(FileNotFoundError, match=r"https://openviking\.ai/docs"):
+            OpenVikingConfigSingleton.get_instance()
+    finally:
+        OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_singleton_initialize_missing_message_uses_openviking_ai_docs(tmp_path, monkeypatch):
+    import openviking_cli.utils.config.open_viking_config as config_module
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+
+    monkeypatch.delenv("OPENVIKING_CONFIG_FILE", raising=False)
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(config_module, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+
+    OpenVikingConfigSingleton.reset_instance()
+    try:
+        with pytest.raises(FileNotFoundError, match=r"https://openviking\.ai/docs"):
+            OpenVikingConfigSingleton.initialize()
+    finally:
+        OpenVikingConfigSingleton.reset_instance()

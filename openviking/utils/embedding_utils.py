@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """
 Embedding utilities for OpenViking.
 
@@ -11,11 +11,13 @@ from datetime import datetime
 from typing import Dict, Optional
 
 from openviking.core.context import Context, ContextLevel, ResourceContentType, Vectorize
+from openviking.core.directories import get_context_type_for_uri
 from openviking.server.identity import RequestContext
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 from openviking.storage.viking_fs import get_viking_fs
 from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
 
@@ -219,8 +221,8 @@ async def vectorize_file(
     Vectorize a single file.
 
     Creates Context object for the file and enqueues it.
-    If use_summary=True and summary is available, uses summary for TEXT files (e.g. code scenario).
-    Otherwise reads raw file content for TEXT files, falls back to summary on failure.
+    The effective vectorization strategy is resolved once from either the explicit
+    `use_summary` flag (code path override) or the embedding config.
     """
     enqueued = False
 
@@ -249,6 +251,16 @@ async def vectorize_file(
         )
 
         content_type = get_resource_content_type(file_name)
+        embedding_cfg = get_openviking_config().embedding
+        configured_text_source = getattr(embedding_cfg, "text_source", "summary_first")
+        effective_text_source = "summary_only" if use_summary else configured_text_source
+        max_input_chars = int(getattr(embedding_cfg, "max_input_chars", 1000) or 1000)
+
+        def _truncate_text(value: str) -> str:
+            if len(value) <= max_input_chars:
+                return value
+            return value[:max_input_chars] + "\n...(truncated for embedding)"
+
         if content_type is None:
             # Unsupported file type: fall back to summary if available
             if summary:
@@ -262,15 +274,15 @@ async def vectorize_file(
                 )
                 return
         elif content_type == ResourceContentType.TEXT:
-            if use_summary and summary:
-                # Code scenario: use pre-generated summary (e.g. AST skeleton) for embedding
+            if summary and effective_text_source in {"summary_first", "summary_only"}:
                 context.set_vectorize(Vectorize(text=summary))
             else:
-                # Default: read raw file content
+                # Read raw file content and apply configured truncation guard.
                 try:
                     content = await viking_fs.read_file(file_path, ctx=ctx)
                     if isinstance(content, bytes):
                         content = content.decode("utf-8", errors="replace")
+                    content = _truncate_text(content)
                     context.set_vectorize(Vectorize(text=content))
                 except Exception as e:
                     logger.warning(
@@ -315,8 +327,13 @@ async def index_resource(
 
     1. Reads .abstract.md and .overview.md and vectorizes them.
     2. Scans files in the directory and vectorizes them.
+
+    The context_type is derived from the URI so that memory directories
+    (``/memories/``) are indexed as ``"memory"`` rather than the default
+    ``"resource"``.
     """
     viking_fs = get_viking_fs()
+    context_type = get_context_type_for_uri(uri)
 
     # 1. Index Directory Metadata
     abstract_uri = f"{uri}/.abstract.md"
@@ -325,18 +342,20 @@ async def index_resource(
     abstract = ""
     overview = ""
 
-    if await viking_fs.exists(abstract_uri):
-        content = await viking_fs.read_file(abstract_uri)
+    if await viking_fs.exists(abstract_uri, ctx=ctx):
+        content = await viking_fs.read_file(abstract_uri, ctx=ctx)
         if isinstance(content, bytes):
             abstract = content.decode("utf-8")
 
-    if await viking_fs.exists(overview_uri):
-        content = await viking_fs.read_file(overview_uri)
+    if await viking_fs.exists(overview_uri, ctx=ctx):
+        content = await viking_fs.read_file(overview_uri, ctx=ctx)
         if isinstance(content, bytes):
             overview = content.decode("utf-8")
 
     if abstract or overview:
-        await vectorize_directory_meta(uri, abstract, overview, ctx=ctx)
+        await vectorize_directory_meta(
+            uri, abstract, overview, context_type=context_type, ctx=ctx
+        )
 
     # 2. Index Files
     try:
@@ -357,7 +376,11 @@ async def index_resource(
             # For direct indexing, we might not have summaries.
             # We pass empty summary_dict, vectorize_file will try to read content for text files.
             await vectorize_file(
-                file_path=file_uri, summary_dict={"name": file_name}, parent_uri=uri, ctx=ctx
+                file_path=file_uri,
+                summary_dict={"name": file_name},
+                parent_uri=uri,
+                context_type=context_type,
+                ctx=ctx,
             )
 
     except Exception as e:

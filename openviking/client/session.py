@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """Lightweight Session class for OpenViking client.
 
 Session delegates all operations to the underlying Client (LocalClient or AsyncHTTPClient).
@@ -40,6 +40,7 @@ class Session:
         role: str,
         content: Optional[str] = None,
         parts: Optional[List[Part]] = None,
+        created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Add a message to the session.
 
@@ -47,6 +48,7 @@ class Session:
             role: Message role (e.g., "user", "assistant")
             content: Text content (simple mode)
             parts: Parts list (TextPart, ContextPart, ToolPart)
+            created_at: Message creation time (ISO format string). If not provided, current time is used.
 
         If both content and parts are provided, parts takes precedence.
 
@@ -55,8 +57,12 @@ class Session:
         """
         if parts is not None:
             parts_dicts = [asdict(p) for p in parts]
-            return await self._client.add_message(self.session_id, role, parts=parts_dicts)
-        return await self._client.add_message(self.session_id, role, content=content)
+            return await self._client.add_message(
+                self.session_id, role, parts=parts_dicts, created_at=created_at
+            )
+        return await self._client.add_message(
+            self.session_id, role, content=content, created_at=created_at
+        )
 
     async def commit(self, telemetry: TelemetryRequest = False) -> Dict[str, Any]:
         """Commit the session (archive messages and extract memories).
@@ -65,6 +71,15 @@ class Session:
             Commit result
         """
         return await self._client.commit_session(self.session_id, telemetry=telemetry)
+
+    async def commit_async(self, telemetry: TelemetryRequest = False) -> Dict[str, Any]:
+        """Commit the session asynchronously (archive messages and extract memories).
+           Used in viking bot for committing.
+
+        Returns:
+            Commit result
+        """
+        return await self.commit(telemetry)
 
     async def delete(self) -> None:
         """Delete the session."""
@@ -77,6 +92,14 @@ class Session:
             Session details
         """
         return await self._client.get_session(self.session_id)
+
+    async def get_session_context(self, token_budget: int = 128_000) -> Dict[str, Any]:
+        """Get assembled session context."""
+        return await self._client.get_session_context(self.session_id, token_budget=token_budget)
+
+    async def get_archive(self, archive_id: str) -> Dict[str, Any]:
+        """Get one completed archive for the session."""
+        return await self._client.get_session_archive(self.session_id, archive_id)
 
     def __repr__(self) -> str:
         return f"Session(id={self.session_id}, user={self.user.__str__()})"

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """
 Memory Deduplicator for OpenViking.
 
@@ -7,6 +7,7 @@ LLM-assisted deduplication with candidate-level skip/create/none decisions and
 per-existing merge/delete actions.
 """
 
+import asyncio
 import copy
 import re
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 from openviking.core.context import Context
-from openviking.models.embedder.base import EmbedResult
+from openviking.models.embedder.base import EmbedResult, embed_compat
 from openviking.prompts import render_prompt
 from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
@@ -90,6 +91,10 @@ class MemoryDeduplicator:
         config = get_openviking_config()
         self.embedder = config.embedding.get_embedder()
 
+    def _is_shutdown_in_progress(self) -> bool:
+        """Whether dedup is running during storage shutdown."""
+        return bool(getattr(self.vikingdb, "is_closing", False))
+
     async def deduplicate(
         self,
         candidate: CandidateMemory,
@@ -146,7 +151,7 @@ class MemoryDeduplicator:
 
         # Generate embedding for candidate
         query_text = f"{candidate.abstract} {candidate.content}"
-        embed_result: EmbedResult = self.embedder.embed(query_text, is_query=True)
+        embed_result: EmbedResult = await embed_compat(self.embedder, query_text, is_query=True)
         query_vector = embed_result.dense_vector
 
         category_uri_prefix = self._category_uri_prefix(candidate.category.value, candidate.user)
@@ -221,6 +226,11 @@ class MemoryDeduplicator:
 
             return similar, query_vector
 
+        except asyncio.CancelledError as e:
+            if not self._is_shutdown_in_progress():
+                raise
+            logger.warning(f"Vector search cancelled during dedup prefilter: {e}")
+            return [], query_vector
         except Exception as e:
             logger.warning(f"Vector search failed: {e}")
             return [], query_vector
@@ -289,6 +299,11 @@ class MemoryDeduplicator:
             logger.debug("Dedup LLM parsed payload: %s", data)
             return self._parse_decision_payload(data, similar_memories, candidate)
 
+        except asyncio.CancelledError as e:
+            if not self._is_shutdown_in_progress():
+                raise
+            logger.warning(f"LLM dedup decision cancelled: {e}")
+            return DedupDecision.CREATE, f"LLM cancelled: {e}", []
         except Exception as e:
             logger.warning(f"LLM dedup decision failed: {e}")
             return DedupDecision.CREATE, f"LLM failed: {e}", []
@@ -424,7 +439,7 @@ class MemoryDeduplicator:
         if len(vec_a) != len(vec_b):
             return 0.0
 
-        dot = sum(a * b for a, b in zip(vec_a, vec_b))
+        dot = sum(a * b for a, b in zip(vec_a, vec_b, strict=False))
         mag_a = sum(a * a for a in vec_a) ** 0.5
         mag_b = sum(b * b for b in vec_b) ** 0.5
 

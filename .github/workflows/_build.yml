@@ -12,7 +12,7 @@ on:
         description: 'JSON string of Python versions'
         required: false
         type: string
-        default: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
+        default: '["3.10"]'
       build_sdist:
         description: 'Whether to build source distribution'
         required: false
@@ -42,7 +42,7 @@ on:
       python_json:
         description: 'JSON string of Python versions'
         required: false
-        default: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
+        default: '["3.10"]'
 
 jobs:
   build-sdist:
@@ -80,9 +80,6 @@ jobs:
         git reset --hard HEAD
         git clean -fd
         # For sdist, ensure local runtime binaries are not packaged even if present
-        rm -rf openviking/bin openviking/lib third_party/agfs/bin || true
-        rm -f openviking/storage/vectordb/*.so openviking/storage/vectordb/*.dylib openviking/storage/vectordb/*.dll openviking/storage/vectordb/*.exe || true
-        rm -rf openviking/_version.py openviking.egg-info
         # Ignore uv.lock changes to avoid dirty state in setuptools_scm
         git update-index --assume-unchanged uv.lock || true
 
@@ -99,7 +96,7 @@ jobs:
         if [ -f openviking/_version.py ]; then cat openviking/_version.py; else echo "Not found"; fi
 
     - name: Build sdist
-      run: uv run --frozen python -m build --sdist
+      run: uv build --sdist
 
     - name: Store the distribution packages
       uses: actions/upload-artifact@v7
@@ -193,11 +190,6 @@ jobs:
         echo "LD_LIBRARY_PATH=${PYTHON_PREFIX}/lib:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib:${LD_LIBRARY_PATH}"
         "$PYTHON_BIN" -V
-    - name: Set up Go
-      uses: actions/setup-go@v6
-      with:
-        go-version: '1.25.1'
-
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@v1
       with:
@@ -218,7 +210,16 @@ jobs:
       run: uv sync --frozen
 
     - name: Install build dependencies
-      run: uv pip install setuptools setuptools_scm pybind11 cmake wheel build
+      run: uv pip install setuptools setuptools_scm cmake wheel build
+
+    - name: Resolve OpenViking version for Rust CLI (Linux)
+      shell: bash
+      run: |
+        OPENVIKING_VERSION=$(
+          uv run --frozen python -c "from build_support.versioning import resolve_openviking_version; print(resolve_openviking_version())"
+        )
+        echo "OPENVIKING_VERSION=$OPENVIKING_VERSION" >> "$GITHUB_ENV"
+        echo "Resolved OpenViking version: $OPENVIKING_VERSION"
 
     - name: Build Rust CLI (Linux)
       run: cargo build --release --target ${{ matrix.arch == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }} -p ov_cli
@@ -228,12 +229,17 @@ jobs:
         mkdir -p openviking/bin
         cp target/${{ matrix.arch == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}/release/ov openviking/bin/
         chmod +x openviking/bin/ov
+
     - name: Clean workspace (force ignore dirty)
       shell: bash
       run: |
+        # Back up pre-built artifacts before cleaning
+        cp -a openviking/bin /tmp/_ov_bin || true
         git reset --hard HEAD
         git clean -fd
         rm -rf openviking/_version.py openviking.egg-info
+        # Restore pre-built artifacts
+        cp -a /tmp/_ov_bin openviking/bin || true
         # Ignore uv.lock changes to avoid dirty state in setuptools_scm
         git update-index --assume-unchanged uv.lock || true
 
@@ -248,9 +254,11 @@ jobs:
         git status --ignored
         echo "=== Check openviking/_version.py ==="
         if [ -f openviking/_version.py ]; then cat openviking/_version.py; else echo "Not found"; fi
+        echo "=== Verify pre-built artifacts survived clean ==="
+        ls -la openviking/bin/ || true
 
     - name: Build package (Wheel Only)
-      run: uv run --frozen python -m build --wheel
+      run: uv build --wheel
 
     - name: Install patchelf (Linux)
       run: |
@@ -267,11 +275,8 @@ jobs:
     - name: Repair wheels (Linux)
       run: |
         uv pip install auditwheel
-        # Repair wheels and output to a temporary directory
         uv run auditwheel repair dist/*.whl -w dist_fixed
-        # Remove original non-compliant wheels
         rm dist/*.whl
-        # Move repaired wheels back to dist
         mv dist_fixed/*.whl dist/
         rmdir dist_fixed
 
@@ -338,11 +343,6 @@ jobs:
         echo "_PYTHON_HOST_PLATFORM=macosx-${MACOS_VERSION}-${TARGET_ARCH}" >> "$GITHUB_ENV"
         echo "Configured macOS wheel platform: macosx-${MACOS_VERSION}-${TARGET_ARCH}"
 
-    - name: Set up Go
-      uses: actions/setup-go@v6
-      with:
-        go-version: '1.25.1'
-
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@v1
       with:
@@ -366,7 +366,16 @@ jobs:
       run: uv sync --frozen
 
     - name: Install build dependencies
-      run: uv pip install setuptools setuptools_scm pybind11 cmake wheel build
+      run: uv pip install setuptools setuptools_scm cmake wheel build
+
+    - name: Resolve OpenViking version for Rust CLI (macOS/Windows)
+      shell: bash
+      run: |
+        OPENVIKING_VERSION=$(
+          uv run --frozen python -c "from build_support.versioning import resolve_openviking_version; print(resolve_openviking_version())"
+        )
+        echo "OPENVIKING_VERSION=$OPENVIKING_VERSION" >> "$GITHUB_ENV"
+        echo "Resolved OpenViking version: $OPENVIKING_VERSION"
 
     - name: Build Rust CLI (macOS/Windows)
       shell: bash
@@ -387,12 +396,17 @@ jobs:
           cp target/release/ov openviking/bin/
           chmod +x openviking/bin/ov
         fi
+
     - name: Clean workspace (force ignore dirty)
       shell: bash
       run: |
+        # Back up pre-built artifacts before cleaning
+        cp -a openviking/bin /tmp/_ov_bin || true
         git reset --hard HEAD
         git clean -fd
         rm -rf openviking/_version.py openviking.egg-info
+        # Restore pre-built artifacts
+        cp -a /tmp/_ov_bin openviking/bin || true
         # Ignore uv.lock changes to avoid dirty state in setuptools_scm
         git update-index --assume-unchanged uv.lock || true
 
@@ -407,9 +421,36 @@ jobs:
         git status --ignored
         echo "=== Check openviking/_version.py ==="
         if [ -f openviking/_version.py ]; then cat openviking/_version.py; else echo "Not found"; fi
+        echo "=== Verify pre-built artifacts survived clean ==="
+        ls -la openviking/bin/ || true
 
     - name: Build package (Wheel Only)
-      run: uv run --frozen python -m build --wheel
+      run: uv build --wheel
+
+    - name: Smoke test built wheel (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install --force-reinstall dist/*.whl
+
+        cd "$RUNNER_TEMP"
+        python - <<'PY'
+        import importlib.util
+
+        import openviking.storage.vectordb.engine as engine
+
+        print(f"Loaded runtime engine variant {engine.ENGINE_VARIANT}")
+        print(f"Available engine variants {engine.AVAILABLE_ENGINE_VARIANTS}")
+
+        module_name = f"openviking.storage.vectordb.engine._{engine.ENGINE_VARIANT}"
+        backend_spec = importlib.util.find_spec(module_name)
+        if backend_spec is None or backend_spec.origin is None:
+            raise SystemExit(f"backend module {module_name} was not installed")
+
+        print(f"Imported backend module {module_name}")
+        print(f"Backend module origin {backend_spec.origin}")
+        PY
 
     - name: Store the distribution packages
       uses: actions/upload-artifact@v7
@@ -424,53 +465,3 @@ jobs:
         VERSION=$(ls dist/*.whl | head -n 1 | xargs basename | cut -d- -f2)
         echo "Build Version: $VERSION"
         echo "::notice::Build Wheel Version (${{ matrix.os == 'macos-14' && 'macOS arm64 (macos-14)' || matrix.os == 'macos-15-intel' && 'macOS x86_64 (macos-15-intel)' || matrix.os == 'windows-latest' && 'Windows x86_64 (windows-latest)' || matrix.os }} py${{ matrix.python-version }}): $VERSION"
-
-  verify-macos-14-wheel-on-macos-15:
-    name: Verify macOS 14 arm64 wheel installs on macOS 15
-    needs: [build-other]
-    if: >-
-      inputs.build_wheels &&
-      contains(inputs.os_json, 'macos-14') &&
-      contains(inputs.python_json, '3.12')
-    runs-on: macos-15
-    steps:
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v6
-      with:
-        python-version: '3.12'
-
-    - name: Download macOS arm64 wheel artifact
-      uses: actions/download-artifact@v8
-      with:
-        name: python-package-distributions-macos-arm64-3.12
-        path: dist/
-
-    - name: Install built wheel
-      shell: bash
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install dist/*.whl
-
-    - name: Smoke test native extension loading
-      shell: bash
-      run: |
-        python - <<'PY'
-        import importlib
-        import importlib.util
-
-        import openviking.storage.vectordb.engine as engine
-
-        native_spec = importlib.util.find_spec("openviking.storage.vectordb.engine._native")
-        if native_spec is None or native_spec.origin is None:
-            raise SystemExit("openviking storage native backend extension was not installed")
-
-        native_module = importlib.import_module("openviking.storage.vectordb.engine._native")
-        if engine.ENGINE_VARIANT != "native":
-            raise SystemExit(
-                f"expected native engine variant on macOS arm64 wheel, got {engine.ENGINE_VARIANT}"
-            )
-
-        print(f"Loaded runtime engine variant {engine.ENGINE_VARIANT}")
-        print(f"Loaded native extension from {native_spec.origin}")
-        print(f"Imported backend module {native_module.__name__}")
-        PY

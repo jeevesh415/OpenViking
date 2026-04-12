@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """Message class definition - based on opencode Message design.
 
 Message = role + parts, supports serialization to JSONL.
@@ -21,7 +21,7 @@ class Message:
     id: str
     role: Literal["user", "assistant"]
     parts: List[Part]
-    created_at: datetime = None
+    created_at: str = None
 
     @property
     def content(self) -> str:
@@ -31,15 +31,45 @@ class Message:
                 return p.text
         return ""
 
+    @property
+    def estimated_tokens(self) -> int:
+        """Estimate token count from all parts (ceil(len/4) heuristic).
+
+        Counts fields that actually appear in the assembled prompt:
+        - TextPart.text: always emitted
+        - ContextPart.abstract: injected as text (uri is not sent to the model)
+        - ToolPart: tool_id (appears in toolUse.id / toolResult.toolCallId),
+          tool_name, tool_input (JSON), tool_output
+
+        Known limitation: ToolPart estimation undercounts by ~10-20 tokens per
+        tool call because tool_id/toolName appear twice in the assembled transcript
+        (toolUse + toolResult), and small literals like "(no output)" / "{}" are
+        not counted. Under 128k budgets this is negligible; for smaller budgets
+        (8k/16k) or tool-dense sessions, consider adding a conservative per-tool
+        buffer instead of mirroring the full convertToAgentMessages logic.
+        """
+        total_chars = 0
+        for p in self.parts:
+            if isinstance(p, TextPart):
+                total_chars += len(p.text)
+            elif isinstance(p, ContextPart):
+                total_chars += len(p.abstract)
+            elif isinstance(p, ToolPart):
+                total_chars += len(p.tool_id) + len(p.tool_name)
+                if p.tool_input:
+                    total_chars += len(json.dumps(p.tool_input, ensure_ascii=False))
+                if p.tool_output:
+                    total_chars += len(p.tool_output)
+        return -(-total_chars // 4)  # ceil division
+
     def to_dict(self) -> dict:
         """Serialize to JSONL."""
-        created_at_val = self.created_at or datetime.now(timezone.utc)
-        created_at_str = format_iso8601(created_at_val)
+        created_at_val = self.created_at or datetime.now(timezone.utc).isoformat()
         return {
             "id": self.id,
             "role": self.role,
             "parts": [self._part_to_dict(p) for p in self.parts],
-            "created_at": created_at_str,
+            "created_at": created_at_val,
         }
 
     def _part_to_dict(self, part: Part) -> dict:
@@ -108,7 +138,7 @@ class Message:
             id=data["id"],
             role=data["role"],
             parts=parts,
-            created_at=parse_iso_datetime(data["created_at"]),
+            created_at=data["created_at"],
         )
 
     @classmethod
@@ -120,7 +150,7 @@ class Message:
             id=msg_id or f"msg_{uuid4().hex}",
             role="user",
             parts=[TextPart(text=content)],
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc).isoformat(),
         )
 
     @classmethod
@@ -163,7 +193,7 @@ class Message:
             id=msg_id or f"msg_{uuid4().hex}",
             role="assistant",
             parts=parts,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc).isoformat()
         )
 
     def get_context_parts(self) -> List[ContextPart]:
