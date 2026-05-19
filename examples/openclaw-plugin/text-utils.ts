@@ -19,7 +19,7 @@ const SENDER_METADATA_BLOCK_RE = /Sender\s*\([^)]*\)\s*:\s*```[\s\S]*?```/gi;
 const FENCED_JSON_BLOCK_RE = /```json\s*([\s\S]*?)```/gi;
 const METADATA_JSON_KEY_RE =
   /"(session|sessionid|sessionkey|conversationid|channel|sender|userid|agentid|timestamp|timezone)"\s*:/gi;
-const LEADING_TIMESTAMP_PREFIX_RE = /^\s*(?!\[\[)\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?(?:\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{2,4})(?:\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[A-Z]{1,5}(?:[+-]\d{1,2})?)?)?\s*\]\s*/i;
+const LEADING_TIMESTAMP_PREFIX_RE = /^\s*(?!\[\[)\[(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+)?(?:\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{2,4})(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{1,2}(?::\d{2})?)?(?:\s*[A-Z]{1,5}(?:[+-]\d{1,2})?)?)?\s*\]\s*/i;
 const COMPACTED_SYSTEM_MSG_RE = /^System:\s*\[.*?\]\s*Compacted\s*(.+)$/i;
 const COMMAND_TEXT_RE = /^\/[a-z0-9_-]{1,64}\b/i;
 const NON_CONTENT_TEXT_RE = /^[\p{P}\p{S}\s]+$/u;
@@ -27,10 +27,6 @@ const SUBAGENT_CONTEXT_RE = /^\s*\[Subagent Context\]/i;
 const MEMORY_INTENT_RE = /记住|记下|remember|save|store|偏好|preference|规则|rule|事实|fact/i;
 const QUESTION_CUE_RE =
   /[?？]|\b(?:what|when|where|who|why|how|which|can|could|would|did|does|is|are)\b|^(?:请问|能否|可否|怎么|如何|什么时候|谁|什么|哪|是否)/i;
-const SPEAKER_TAG_RE = /(?:^|\s)([A-Za-z\u4e00-\u9fa5][A-Za-z0-9_\u4e00-\u9fa5-]{1,30}):\s/g;
-
-export const CAPTURE_LIMIT = 3;
-
 function resolveCaptureMinLength(text: string): number {
   return CJK_CHAR_REGEX.test(text) ? 4 : 10;
 }
@@ -71,6 +67,7 @@ export function sanitizeUserTextForCapture(text: string): string {
       looksLikeMetadataJsonBlock(String(inner ?? "")) ? " " : full,
     )
     .replace(LEADING_TIMESTAMP_PREFIX_RE, "")
+    .replace(SUBAGENT_CONTEXT_RE, "")
     .replace(/\u0000/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -87,14 +84,6 @@ export function looksLikeQuestionOnlyText(text: string): boolean {
   }
   return true;
 }
-
-export type TranscriptLikeIngestDecision = {
-  shouldAssist: boolean;
-  reason: string;
-  normalizedText: string;
-  speakerTurns: number;
-  chars: number;
-};
 
 export function compileSessionPattern(pattern: string): RegExp {
   const escaped = pattern
@@ -140,113 +129,6 @@ export function shouldBypassSession(
     return false;
   }
   return matchesSessionPattern(candidate, patterns);
-}
-
-export function shouldSkipIngestReplyAssistSession(
-  params: {
-    sessionId?: string;
-    sessionKey?: string;
-  },
-  patterns: RegExp[],
-): boolean {
-  return shouldBypassSession(params, patterns);
-}
-
-function countSpeakerTurns(text: string): number {
-  let count = 0;
-  for (const _match of text.matchAll(SPEAKER_TAG_RE)) {
-    count += 1;
-  }
-  return count;
-}
-
-export function isTranscriptLikeIngest(
-  text: string,
-  options: {
-    minSpeakerTurns: number;
-    minChars: number;
-  },
-): TranscriptLikeIngestDecision {
-  const normalizedText = sanitizeUserTextForCapture(text.trim());
-  if (!normalizedText) {
-    return {
-      shouldAssist: false,
-      reason: "empty_text",
-      normalizedText,
-      speakerTurns: 0,
-      chars: 0,
-    };
-  }
-
-  if (COMMAND_TEXT_RE.test(normalizedText)) {
-    return {
-      shouldAssist: false,
-      reason: "command_text",
-      normalizedText,
-      speakerTurns: 0,
-      chars: normalizedText.length,
-    };
-  }
-
-  if (SUBAGENT_CONTEXT_RE.test(normalizedText)) {
-    return {
-      shouldAssist: false,
-      reason: "subagent_context",
-      normalizedText,
-      speakerTurns: 0,
-      chars: normalizedText.length,
-    };
-  }
-
-  if (NON_CONTENT_TEXT_RE.test(normalizedText)) {
-    return {
-      shouldAssist: false,
-      reason: "non_content_text",
-      normalizedText,
-      speakerTurns: 0,
-      chars: normalizedText.length,
-    };
-  }
-
-  if (looksLikeQuestionOnlyText(normalizedText)) {
-    return {
-      shouldAssist: false,
-      reason: "question_text",
-      normalizedText,
-      speakerTurns: 0,
-      chars: normalizedText.length,
-    };
-  }
-
-  const chars = normalizedText.length;
-  if (chars < options.minChars) {
-    return {
-      shouldAssist: false,
-      reason: "chars_below_threshold",
-      normalizedText,
-      speakerTurns: 0,
-      chars,
-    };
-  }
-
-  const speakerTurns = countSpeakerTurns(normalizedText);
-  if (speakerTurns < options.minSpeakerTurns) {
-    return {
-      shouldAssist: false,
-      reason: "speaker_turns_below_threshold",
-      normalizedText,
-      speakerTurns,
-      chars,
-    };
-  }
-
-  return {
-    shouldAssist: true,
-    reason: "transcript_like_ingest",
-    normalizedText,
-    speakerTurns,
-    chars,
-  };
 }
 
 function normalizeDedupeText(text: string): string {
@@ -390,21 +272,6 @@ export function extractTextsFromUserMessages(messages: unknown[]): string[] {
   return texts;
 }
 
-function formatToolUseBlock(b: Record<string, unknown>): string {
-  const name = typeof b.name === "string" ? b.name : "unknown";
-  let inputStr = "";
-  if (b.input !== undefined && b.input !== null) {
-    try {
-      inputStr = typeof b.input === "string" ? b.input : JSON.stringify(b.input);
-    } catch {
-      inputStr = String(b.input);
-    }
-  }
-  return inputStr
-    ? `[toolUse: ${name}]\n${inputStr}`
-    : `[toolUse: ${name}]`;
-}
-
 function formatToolResultContent(content: unknown): string {
   if (typeof content === "string") return content.trim();
   if (Array.isArray(content)) {
@@ -423,39 +290,6 @@ function formatToolResultContent(content: unknown): string {
     } catch {
       return String(content);
     }
-  }
-  return "";
-}
-
-/**
- * Extract text from a single message without a `[role]:` prefix.
- * Used by afterTurn to send messages with their actual role.
- */
-export function extractSingleMessageText(msg: unknown): string {
-  if (!msg || typeof msg !== "object") return "";
-  const m = msg as Record<string, unknown>;
-  const role = m.role as string;
-  if (!role || role === "system") return "";
-
-  if (role === "toolResult") {
-    const toolName = typeof m.toolName === "string" ? m.toolName : "tool";
-    const resultText = formatToolResultContent(m.content);
-    return resultText ? `[${toolName} result]: ${resultText}` : "";
-  }
-
-  const content = m.content;
-  if (typeof content === "string") return content.trim();
-  if (Array.isArray(content)) {
-    const parts: string[] = [];
-    for (const block of content) {
-      const b = block as Record<string, unknown>;
-      if (b?.type === "text" && typeof b.text === "string") {
-        parts.push((b.text as string).trim());
-      } else if (b?.type === "toolUse") {
-        parts.push(formatToolUseBlock(b));
-      }
-    }
-    return parts.join("\n");
   }
   return "";
 }
@@ -483,13 +317,14 @@ function extractPartText(content: unknown): string {
 /**
  * 结构化消息类型 - 用于 afterTurn 发送到 OpenViking
  */
-export type ExtractedMessage = {
+type ExtractedMessage = {
   role: "user" | "assistant";
   parts: Array<{
     type: "text";
     text: string;
   } | {
     type: "tool";
+    toolCallId?: string;
     toolName: string;
     toolInput?: Record<string, unknown>;
     toolOutput: string;
@@ -562,6 +397,7 @@ export function extractNewTurnMessages(
           role: "user",
           parts: [{
             type: "tool",
+            toolCallId: toolCallId || undefined,
             toolName,
             toolInput,
             toolOutput: output,
@@ -573,7 +409,6 @@ export function extractNewTurnMessages(
     }
 
     // user/assistant -> type: "text"
-    // 统一 role 为 user
     const content = msg.content;
     const text = extractPartText(content);
 
@@ -609,4 +444,30 @@ export function extractLatestUserText(messages: unknown[] | undefined): string {
     }
   }
   return "";
+}
+
+/**
+ * Backward-compatible wrapper around extractNewTurnMessages.
+ * Returns flat text strings in the legacy `[role]: text` format.
+ * @deprecated Use extractNewTurnMessages for structured output.
+ */
+export function extractNewTurnTexts(
+  messages: unknown[],
+  startIndex: number,
+): { texts: string[]; newCount: number } {
+  const { messages: extracted, newCount } = extractNewTurnMessages(messages, startIndex);
+  const texts: string[] = [];
+  for (const msg of extracted) {
+    for (const part of msg.parts) {
+      if (part.type === "text") {
+        texts.push(`[${msg.role}]: ${part.text}`);
+      } else if (part.type === "tool") {
+        if (part.toolInput && Object.keys(part.toolInput).length > 0) {
+          texts.push(`[toolUse: ${part.toolName}] ${JSON.stringify(part.toolInput)}`);
+        }
+        texts.push(`[${part.toolName} result]: ${part.toolOutput}`);
+      }
+    }
+  }
+  return { texts, newCount };
 }

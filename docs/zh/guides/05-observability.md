@@ -15,7 +15,7 @@
 | 入口 | 适合看什么 | 典型场景 |
 | --- | --- | --- |
 | `/health`、`observer/*` | 服务是否健康、队列是否堆积、VikingDB/VLM 状态 | 部署验收、值班巡检 |
-| `ov tui` | `viking://` 文件树、目录摘要、文件正文、向量记录 | 开发调试、核对资源是否真正落库 |
+| `ov tui` | `viking://` 文件树、目录摘要、文件正文、向量记录、受支持图片文件的预览 | 开发调试、核对资源是否真正落库 |
 | `OpenViking Console` | Web UI 里的文件浏览、检索、资源导入、租户与系统状态 | 不想手敲命令时做交互式排查 |
 | `telemetry` | 单次请求耗时、token、向量检索、资源处理阶段 | 排查一次具体调用为什么慢、为什么结果异常 |
 | `/metrics` | 请求量趋势、错误率、时延分布、队列与探针状态 | Prometheus 抓取、Grafana 看板、告警规则 |
@@ -152,7 +152,7 @@ ov tui viking://resources
 一个常见排查流程是：
 
 1. 用 `ov tui viking://resources` 找到目标文档或目录。
-2. 确认右侧能看到 `abstract` / `overview` / 正文内容。
+2. 确认右侧能看到 `abstract` / `overview` / 正文内容（受支持的图片文件 —— `png` / `jpg` / `jpeg` / `gif` / `bmp` / `webp` / `tiff` / `tif` —— 会直接渲染预览）。
 3. 按 `v` 进入向量记录视图，确认该 URI 下是否已经有向量数据。
 4. 按 `c` 查看总量，必要时按 `n` 翻页继续核对。
 
@@ -246,6 +246,103 @@ curl -X POST http://localhost:1933/api/v1/search/find \
 
 和前面的 `telemetry` 相比，`/metrics` 关注的是**聚合后的时间序列**；`telemetry` 关注的是**某一次请求内部到底发生了什么**。
 
+### 快速开启 metrics
+
+`/metrics` 默认是关闭的：当指标体系未启用时，访问会返回 `404`，并提示 `Prometheus metrics are disabled.`。
+
+开启方式不需要完整配置，只需要在 `ov.conf` 的 `server` 段打开总开关即可。
+
+**最小配置（推荐）**
+
+在 `~/.openviking/ov.conf`（或你启动时通过 `--config` 指定的路径）里加入：
+
+```json
+{
+  "server": {
+    "observability": {
+      "metrics": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+改完配置后需要**重启 OpenViking Server** 才会生效。
+
+### observability 配置层级
+
+OpenViking 将信号级别的可观测性配置统一放在 `server.observability` 下：
+
+- `server.observability.metrics`：metrics 子系统与 exporter 配置
+- `server.observability.traces`：trace 导出配置
+- `server.observability.logs`：log 导出配置
+- `server.observability.dump_body`：把 HTTP 请求/响应 body（按 content-type 过滤、按字节截断）作为属性挂到当前 trace span 上，便于在 trace UI 中调试。默认关闭，因为 body 可能含密钥/高基数内容
+
+示例：
+
+```json
+{
+  "server": {
+    "observability": {
+      "metrics": {
+        "enabled": true,
+        "exporters": {
+          "prometheus": {
+            "enabled": true
+          },
+          "otel": {
+            "enabled": true,
+            "protocol": "grpc",
+            "tls": {
+              "insecure": true
+            },
+            "endpoint": "otel-collector:4317",
+            "service_name": "openviking-server",
+            "export_interval_ms": 10000,
+            "headers": {}
+          }
+        }
+      },
+      "traces": {
+        "enabled": true,
+        "protocol": "grpc",
+        "tls": {
+          "insecure": true
+        },
+        "endpoint": "otel-collector:4317",
+        "service_name": "openviking-server",
+        "headers": {}
+      },
+      "logs": {
+        "enabled": true,
+        "protocol": "grpc",
+        "tls": {
+          "insecure": true
+        },
+        "endpoint": "otel-collector:4317",
+        "service_name": "openviking-server",
+        "headers": {}
+      },
+      "dump_body": {
+        "enabled": false,
+        "max_bytes": 4096
+      }
+    }
+  }
+}
+```
+
+说明：
+
+- `headers` 用于给 OTLP exporter 透传自定义请求头或 gRPC metadata。
+- 常见场景包括直连需要额外鉴权头的 OTLP 后端；请只配置 header key/value，不要把敏感值写入日志或截图中。
+- 对 `traces`、`logs` 和 `metrics.exporters.otel` 三条链路，`headers` 的配置方式保持一致。
+- 当 `protocol="grpc"` 时，`headers` 会作为 gRPC metadata 发送，key 需要使用小写形式，例如 `x-byteapm-appkey`；该限制不适用于 `protocol="http"`。
+
+完整字段、支持范围和更多示例见：
+
+- [指标](../concepts/12-metrics.md) 
+
 ### 直接访问 `/metrics`
 
 当前实现中，`/metrics` 未接入 `get_request_context` 等鉴权依赖，因此从代码行为上看，它当前等价于公开抓取端点：
@@ -284,9 +381,10 @@ scrape_configs:
 
 **第 2 步：在 Grafana 导入官方 demo dashboard**
 
-OpenViking 仓库里已经提供了一个可直接导入的 dashboard JSON：
+OpenViking 仓库里已经提供了可直接导入的 dashboard JSON：
 
 - [openviking_demo_dashboard.json](../../../examples/grafana/openviking_demo_dashboard.json)
+- [openviking_token_demo_dashboard.json](../../../examples/grafana/openviking_token_demo_dashboard.json) （注意，该 dashboard 依赖 `tim012432-calendarheatmap-panel` grafana 插件，需要先安装才能正常工作）
 
 导入步骤可以按下面做：
 
@@ -337,9 +435,10 @@ OpenViking 仓库里已经提供了一个可直接导入的 dashboard JSON：
 
 ## 相关文档
 
+- [使用 Prometheus 和 Grafana 查看 OpenViking 指标](11-grafana-prometheus.md) - 从 `/metrics` 到 Prometheus、Grafana dashboard 的完整操作流程
+- [使用真实问答验证 Vikingbot 指标](12-vikingbot-metrics-validation.md) - 用 `/bot/v1/chat`、`/bot/v1/feedback` 和真实 follow-up 场景校验反馈与 outcome 指标
 - [部署](03-deployment.md) - 服务器设置
 - [认证](04-authentication.md) - API Key 设置
 - [操作级 Telemetry 参考](07-operation-telemetry.md) - 请求级结构化追踪
 - [系统 API](../api/07-system.md) - 系统与 observer 接口参考
 - [指标](../concepts/12-metrics.md) - 时序指标与配置
-

@@ -2,6 +2,15 @@
 
 OpenViking uses a JSON configuration file (`~/.openviking/ov.conf`) for settings.
 
+For a first-time setup, the recommended flow is:
+
+```bash
+openviking-server init
+openviking-server doctor
+```
+
+`openviking-server init` prompts for embedding and VLM settings separately. For API-based VLM choices such as `OpenAI`, `Volcengine`, `Kimi`, and `GLM`, enter the VLM API key when prompted. If you want to use Codex as the VLM provider, choose `OpenAI Codex`; the wizard can import existing Codex auth or guide you through login directly.
+
 ## Configuration File
 
 Create `~/.openviking/ov.conf` in your project directory:
@@ -35,6 +44,8 @@ Create `~/.openviking/ov.conf` in your project directory:
   }
 }
 ```
+
+For `provider: "openai-codex"`, `vlm.api_key` is optional when Codex OAuth is already available.
 
 ## Configuration Examples
 
@@ -74,18 +85,98 @@ Create `~/.openviking/ov.conf` in your project directory:
       "api_base" : "https://api.openai.com/v1",
       "api_key"  : "your-openai-api-key",
       "provider" : "openai",
-      "dimension": 3072,
-      "model"    : "text-embedding-3-large"
+      "dimension": 1536,
+      "model"    : "text-embedding-3-small"
     }
   },
   "vlm": {
     "api_base" : "https://api.openai.com/v1",
     "api_key"  : "your-openai-api-key",
     "provider" : "openai",
-    "model"    : "gpt-4-vision-preview"
+    "model"    : "gpt-5.4"
   }
 }
 ```
+
+</details>
+
+<details>
+<summary><b>Volcengine Embedding + Codex VLM</b></summary>
+
+Use `openviking-server init` to complete the Codex login/import step, then run `openviking-server doctor`.
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key"  : "your-volcengine-api-key",
+      "provider" : "volcengine",
+      "dimension": 1024,
+      "model"    : "doubao-embedding-vision-251215"
+    }
+  },
+  "vlm": {
+    "provider" : "openai-codex",
+    "model"    : "gpt-5.4",
+    "api_base" : "https://chatgpt.com/backend-api/codex"
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><b>Volcengine Embedding + Kimi Coding VLM</b></summary>
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key"  : "your-volcengine-api-key",
+      "provider" : "volcengine",
+      "dimension": 1024,
+      "model"    : "doubao-embedding-vision-251215"
+    }
+  },
+  "vlm": {
+    "provider" : "kimi",
+    "model"    : "kimi-code",
+    "api_key"  : "your-kimi-subscription-api-key",
+    "api_base" : "https://api.kimi.com/coding"
+  }
+}
+```
+
+`kimi` applies the Kimi Coding defaults automatically, including the default Kimi Coding user agent.
+
+</details>
+
+<details>
+<summary><b>Volcengine Embedding + GLM Coding Plan VLM</b></summary>
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key"  : "your-volcengine-api-key",
+      "provider" : "volcengine",
+      "dimension": 1024,
+      "model"    : "doubao-embedding-vision-251215"
+    }
+  },
+  "vlm": {
+    "provider" : "glm",
+    "model"    : "glm-4.6v",
+    "api_key"  : "your-zai-api-key",
+    "api_base" : "https://api.z.ai/api/coding/paas/v4"
+  }
+}
+```
+
+Use a vision-capable GLM model such as `glm-4.6v` or `glm-5v-turbo` when OpenViking needs image understanding.
 
 </details>
 
@@ -102,6 +193,8 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
   "embedding": {
     "max_concurrent": 10,
     "max_retries": 3,
+    "text_source": "content_only",
+    "max_input_tokens": 4096,
     "dense": {
       "provider": "volcengine",
       "api_key": "your-api-key",
@@ -119,12 +212,15 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
 |-----------|------|-------------|
 | `max_concurrent` | int | Maximum concurrent embedding requests (`embedding.max_concurrent`, default: `10`) |
 | `max_retries` | int | Maximum retry attempts for transient embedding provider errors (`embedding.max_retries`, default: `3`; `0` disables retry) |
-| `provider` | str | `"volcengine"`, `"openai"`, `"vikingdb"`, `"jina"`, `"voyage"`, or `"gemini"` |
+| `text_source` | str | Text used for vectorizing text files. `content_only` reads raw content, `summary_first` uses summary when available and falls back to content, `summary_only` uses only summary. Default: `content_only` |
+| `max_input_tokens` | int | Maximum estimated raw text tokens sent to the embedding model when content is used. Default: `4096` |
+| `provider` | str | `"openai"`, `"azure"`, `"volcengine"`, `"vikingdb"`, `"jina"`, `"ollama"`, `"gemini"`, `"voyage"`, `"dashscope"`, `"minimax"`, `"cohere"`, `"litellm"`, or `"local"` |
 | `api_key` | str | API key |
 | `model` | str | Model name |
 | `dimension` | int | Vector dimension. For Voyage, this maps to `output_dimension` |
 | `input` | str | Input type: `"text"` or `"multimodal"` |
 | `batch_size` | int | Batch size for embedding requests |
+| `encoding_format` | str | (OpenAI / Azure only) Wire format for embedding values: `"float"` or `"base64"`. Leave unset to use the OpenAI Python SDK default. Set to `"float"` when the upstream gateway cannot deserialize base64 embedding payloads correctly. |
 
 `embedding.max_retries` only applies to transient errors such as `429`, `5xx`, timeouts, and connection failures. Permanent errors such as `400`, `401`, `403`, and `AccountOverdue` are not retried automatically. The backoff strategy is exponential backoff with jitter, starting at `0.5s` and capped at `8s`.
 
@@ -161,12 +257,57 @@ With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), 
 
 **Supported providers:**
 - `openai`: OpenAI Embedding API
+- `azure`: Azure OpenAI Embedding API
 - `volcengine`: Volcengine Embedding API
 - `vikingdb`: VikingDB Embedding API
 - `jina`: Jina AI Embedding API
+- `ollama`: Ollama local OpenAI-compatible Embedding API
 - `voyage`: Voyage AI Embedding API
 - `minimax`: MiniMax Embedding API
+- `cohere`: Cohere Embedding API
 - `gemini`: Google Gemini Embedding API (text-only; requires `google-genai>=1.0.0`)
+- `dashscope`: DashScope (Alibaba Tongyi) Embedding API
+- `litellm`: LiteLLM Embedding API
+- `local`: Local GGUF embedding models
+
+**OpenAI-compatible provider example with JSON float embeddings:**
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "openai",
+      "api_key": "your-api-key",
+      "api_base": "https://your-openai-compatible-endpoint/v1",
+      "model": "text-embedding-3-large",
+      "dimension": 3072,
+      "encoding_format": "float"
+    }
+  }
+}
+```
+
+`encoding_format` is optional and is only forwarded for `provider: "openai"` and `provider: "azure"`. Leave it unset for the OpenAI Python SDK default. Set it to `"float"` when an OpenAI-compatible upstream gateway cannot deserialize base64 embedding payloads correctly.
+
+**Azure OpenAI provider example with JSON float embeddings:**
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "azure",
+      "api_key": "your-azure-api-key",
+      "api_base": "https://your-resource-name.openai.azure.com",
+      "api_version": "2025-01-01-preview",
+      "model": "your-embedding-deployment-name",
+      "dimension": 3072,
+      "encoding_format": "float"
+    }
+  }
+}
+```
+
+For Azure OpenAI, `model` must be the embedding deployment name configured in Azure.
 
 **minimax provider example:**
 
@@ -300,6 +441,52 @@ Recommended dimensions: `768`, `1536`, or `3072` (default: `3072`).
 
 Get your API key at https://aistudio.google.com/apikey
 
+**DashScope (Alibaba Tongyi) provider:**
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "dashscope",
+      "api_key": "${DASHSCOPE_API_KEY}",
+      "model": "text-embedding-v4",
+      "dimension": 1024
+    }
+  }
+}
+```
+
+**Available DashScope models:**
+
+| Model | Dimension | Input Type | Notes |
+|-------|-----------|------------|-------|
+| `text-embedding-v3` | 1024 | text | Optimized for Chinese |
+| `text-embedding-v4` | 1024 | text | Optimized for Chinese |
+| `tongyi-embedding-vision-plus` | 1152 | multimodal | Supports fusion via `enable_fusion` |
+| `tongyi-embedding-vision-flash` | 768 | multimodal | Faster, lower cost |
+| `qwen3-vl-embedding` | 2560 | multimodal | Text + image + video |
+| `qwen2.5-vl-embedding` | 1024 | multimodal | Text + image + video |
+
+**Multimodal parameters** (text+image/video models only):
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `input_type` | str | `"multimodal"` or `"text"` | Embedding mode (default: `"multimodal"`) |
+| `enable_fusion` | bool | `false` | Enable fusion vectors for `tongyi-embedding-vision-*` models |
+| `res_level` | int | `2` | Image resolution level (1=high, 2=medium, 3=low) |
+| `max_video_frames` | int | `16` | Maximum video frames to embed |
+
+**Endpoint selection** — DashScope provides `api_base` defaults for China (`cn`) and international (`intl`) regions:
+
+| Region | `api_base` | Notes |
+|--------|-----------|-------|
+| China | `https://dashscope.aliyuncs.com` (default) | Recommended for users in mainland China |
+| International | `https://dashscope-intl.aliyuncs.com` | For users outside China |
+
+Custom endpoint URLs are also supported by setting a full URL.
+
+Get your API key at https://dashscope.console.aliyun.com/api-key
+
 **Non-symmetric retrieval** (different task types for indexing vs. query):
 
 ```json
@@ -393,13 +580,17 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `api_key` | str | API key |
+| `api_key` | str | API key. Optional for `openai-codex` when Codex OAuth is available, and optional for `litellm` routes that use provider-native credentials |
+| `forward_api_key` | bool | LiteLLM only. Overrides whether `api_key` is forwarded to LiteLLM. By default, OpenViking does not forward placeholder keys for native AWS/GCP routes such as `bedrock/`, `sagemaker/`, and `vertex_ai/`; set to `true` when intentionally using a LiteLLM API-key route such as Bedrock bearer-token auth |
 | `model` | str | Model name |
 | `api_base` | str | API endpoint (optional) |
 | `thinking` | bool | Enable thinking mode for VolcEngine models (default: `false`) |
 | `max_concurrent` | int | Maximum concurrent semantic LLM calls (default: `100`) |
 | `max_retries` | int | Maximum retry attempts for transient VLM provider errors (default: `3`; `0` disables retry) |
-| `extra_headers` | object | Custom HTTP headers (for OpenAI-compatible providers, optional) |
+| `backup` | object | Optional backup VLM configuration (same shape as `vlm`) for automatic failover when the primary fails with retryable errors such as rate limits, `5xx` responses, or connection/timeout failures. Only one level of failover is supported &mdash; the backup itself cannot define a nested `backup` |
+| `timeout` | float | Per-request HTTP timeout in seconds passed to the underlying OpenAI/LiteLLM client. Increase for slow endpoints (e.g., DashScope, local inference). Must be `> 0` (default: `60.0`) |
+| `extra_headers` | object | Custom HTTP headers for compatible HTTP providers. `kimi` also accepts header overrides, but already injects the required subscription headers by default |
+| `extra_request_body` | object | Extra JSON body fields for OpenAI-compatible completion requests, useful for provider-specific options such as Ollama `{"think": false}` |
 | `stream` | bool | Enable streaming mode (for OpenAI-compatible providers, default: `false`) |
 
 `vlm.max_retries` only applies to transient errors such as `429`, `5xx`, timeouts, and connection failures. Permanent authentication, authorization, and billing errors are not retried automatically. The backoff strategy is exponential backoff with jitter, starting at `0.5s` and capped at `8s`.
@@ -417,6 +608,22 @@ When resources are added, VLM generates:
 2. **L1 (Overview)**: ~2k token overview with navigation
 
 If VLM is not configured, L0/L1 will be generated from content directly (less semantic), and multimodal resources may have limited descriptions.
+
+**Supported providers:**
+- `volcengine`: Volcengine VLM API
+- `openai`: OpenAI-compatible VLM API
+- `openai-codex`: Codex VLM via ChatGPT/Codex OAuth
+- `kimi`: Kimi Coding subscription endpoint with built-in provider defaults
+- `glm`: Z.AI GLM Coding Plan endpoint with OpenAI-compatible requests
+- `litellm`: LiteLLM VLM API, including explicit LiteLLM routes such as `bedrock/`, `sagemaker/`, `vertex_ai/`, and `azure/`
+
+For `openai-codex`, authenticate through `openviking-server init`, then verify with `openviking-server doctor`.
+
+For `litellm`, `api_key` can be omitted when the underlying route authenticates through
+environment or provider-native credentials, such as AWS IAM/IRSA for Bedrock and
+SageMaker or ADC/service-account credentials for Vertex AI. Azure routes still use
+`api_key` normally. If you intentionally use LiteLLM's Bedrock bearer-token API-key
+auth, set `forward_api_key` to `true`.
 
 **Custom HTTP Headers**
 
@@ -439,8 +646,27 @@ For OpenAI-compatible providers (e.g., OpenRouter), you can add custom HTTP head
 
 Common use cases:
 - **OpenRouter**: Requires `HTTP-Referer` and `X-Title` to identify your application
+- **Kimi Coding**: Override or extend the default subscription headers when you need a custom user agent
 - **Custom proxies**: Add authentication or tracing headers
 - **API gateways**: Add version or routing identifiers
+
+**Custom Request Body**
+
+For OpenAI-compatible providers that accept provider-specific JSON body fields, add them via `extra_request_body`. OpenViking merges these fields into the `extra_body` sent by the OpenAI SDK or LiteLLM:
+
+```json
+{
+  "vlm": {
+    "provider": "litellm",
+    "api_key": "ollama",
+    "model": "ollama/llama3.1",
+    "api_base": "http://127.0.0.1:11434",
+    "extra_request_body": {
+      "think": false
+    }
+  }
+}
+```
 
 **Streaming Mode**
 
@@ -524,7 +750,7 @@ See [Code Skeleton Extraction](../concepts/06-extraction.md#code-skeleton-extrac
 
 ### rerank
 
-Reranking model for search result refinement. Supports VikingDB (Volcengine), Cohere, OpenAI-compatible APIs, and LiteLLM.
+Reranking model for search result refinement. Supports VikingDB (Volcengine), Cohere, and OpenAI-compatible APIs.
 
 **Volcengine (VikingDB):**
 
@@ -558,13 +784,13 @@ Reranking model for search result refinement. Supports VikingDB (Volcengine), Co
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `provider` | str | `"vikingdb"`, `"cohere"`, `"openai"`, or `"litellm"`. Auto-detected if omitted. |
+| `provider` | str | `"vikingdb"`, `"cohere"`, or `"openai"`. Auto-detected if omitted. |
 | `ak` | str | VikingDB Access Key (vikingdb provider only) |
 | `sk` | str | VikingDB Secret Key (vikingdb provider only) |
 | `model_name` | str | Model name (vikingdb provider only, default: `doubao-seed-rerank`) |
-| `api_key` | str | API key (for `openai`, `cohere`, or `litellm` providers) |
+| `api_key` | str | API key (for `openai` or `cohere` providers) |
 | `api_base` | str | Endpoint URL (for `openai` provider) |
-| `model` | str | Model name (for `openai` or `litellm` providers) |
+| `model` | str | Model name (for `openai` providers) |
 | `threshold` | float | Score threshold between `0.0` and `1.0`; results below this are filtered out. Default: `0.1` |
 | `extra_headers` | object | Custom HTTP headers (for OpenAI-compatible providers, optional) |
 
@@ -572,9 +798,28 @@ Reranking model for search result refinement. Supports VikingDB (Volcengine), Co
 - `vikingdb`: Volcengine VikingDB Rerank API (uses AK/SK)
 - `cohere`: Cohere Rerank API
 - `openai`: OpenAI-compatible Rerank API
-- `litellm`: Rerank services via LiteLLM (requires `litellm` package)
 
 If rerank is not configured, search uses vector similarity only.
+
+### retrieval
+
+Retrieval ranking configuration for final search scores.
+
+```json
+{
+  "retrieval": {
+    "hotness_alpha": 0.0,
+    "score_propagation_alpha": 1.0
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `hotness_alpha` | float | Weight for blending hotness into final retrieval scores. `0.0` disables the hotness boost and keeps scores equal to semantic similarity; `1.0` uses only hotness. Valid range: `0.0` to `1.0`. | `0.0` |
+| `score_propagation_alpha` | float | Weight for each child result's own score when blending with its parent score during hierarchical retrieval. `1.0` ignores the parent score (semantic similarity only); `0.5` is an equal blend with the parent score; `0.0` uses only the parent score. Valid range: `0.0` to `1.0`. | `1.0` |
+
+Keep `hotness_alpha` at `0.0` when you need scores to reflect pure vector similarity. Set it above `0.0` only when frequently accessed or recently updated contexts should receive a ranking boost.
 
 ### storage
 
@@ -610,11 +855,78 @@ Storage configuration for context data, including file storage (RAGFS) and vecto
 |-----------|------|-------------|---------|
 | `backend` | str | `"local"`, `"s3"`, or `"memory"` | `"local"` |
 | `timeout` | float | Request timeout in seconds | `10.0` |
+| `queuefs` | object | QueueFS configuration. Controls the namespace mode, backend, and runtime options for `/queue` | `{ "mode": "shared", "backend": "sqlite", "recover_stale_sec": 0, "busy_timeout_ms": 5000 }` |
+| `queue_db_path` | str (optional) | Legacy compatibility field for QueueFS sqlite DB path. Superseded by `storage.agfs.queuefs.db_path`. Defaults to `{storage.workspace}/_system/queue/queue.db` when not set. Useful when the workspace volume does not support sqlite (e.g. some network filesystems) | `null` |
 | `s3` | object | S3 backend configuration (when backend is 's3') | - |
 
 **Configuration Examples**
 
 RAGFS uses Rust binding mode by default, directly accessing the file system through the Rust implementation.
+
+##### QueueFS Configuration
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `mode` | str | QueueFS namespace mode: `"shared"` uses `/queue`; `"worker"` isolates each worker under `/queue/worker-<index\|pid>` | `"shared"` |
+| `backend` | str | QueueFS backend: `"memory"`, `"sqlite"`, or `"sqlite3"` | `"sqlite"` |
+| `db_path` | str (optional) | SQLite database path for QueueFS when backend is `"sqlite"` or `"sqlite3"` | `null` |
+| `recover_stale_sec` | int | Recover `processing` queue messages older than this many seconds on startup. `0` means recover all stale processing messages | `0` |
+| `busy_timeout_ms` | int | SQLite busy timeout for QueueFS in milliseconds | `5000` |
+
+Notes:
+
+- QueueFS defaults to `sqlite` even if the main AGFS storage backend is `local`, `s3`, or `memory`.
+- `mode=shared` keeps the historical global queue namespace at `/queue`; `mode=worker` isolates each worker under `/queue/worker-<index|pid>`.
+- `db_path` is only used when QueueFS backend is `sqlite` or `sqlite3`.
+- If both `storage.agfs.queuefs.db_path` and legacy `storage.agfs.queue_db_path` are set, `storage.agfs.queuefs.db_path` wins.
+- If QueueFS backend is `memory`, any `db_path` or legacy `queue_db_path` is ignored.
+
+Examples:
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "queuefs": {
+        "mode": "shared",
+        "backend": "sqlite",
+        "db_path": "./data/_system/queue/custom-queue.db"
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "queuefs": {
+        "mode": "worker",
+        "backend": "memory"
+      }
+    }
+  }
+}
+```
+
+Legacy compatibility example:
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "queue_db_path": "./data/_system/queue/queue.db"
+    }
+  }
+}
+```
 
 
 ##### S3 Backend Configuration
@@ -625,11 +937,12 @@ RAGFS uses Rust binding mode by default, directly accessing the file system thro
 | `region` | str | AWS region where the bucket is located (e.g., us-east-1, cn-beijing) | null |
 | `access_key` | str | S3 access key ID | null |
 | `secret_key` | str | S3 secret access key corresponding to the access key ID | null |
-| `endpoint` | str | Custom S3 endpoint URL, required for S3-compatible services like MinIO or LocalStack | null |
+| `endpoint` | str | Custom S3 endpoint, required for S3-compatible services like MinIO or LocalStack. Accepts a full URL (`https://...` or `http://...`) or a bare hostname; bare hostnames are auto-prefixed with `https://` or `http://` based on `use_ssl` | null |
 | `prefix` | str | Optional key prefix for namespace isolation | "" |
-| `use_ssl` | bool | Enable/disable SSL (HTTPS) for S3 connections | true |
+| `use_ssl` | bool | Enable/disable SSL (HTTPS) for S3 connections. Also controls the scheme auto-prefixed onto bare-hostname `endpoint` values | true |
 | `use_path_style` | bool | true for PathStyle used by MinIO and some S3-compatible services; false for VirtualHostStyle used by TOS and some S3-compatible services | true |
 | `directory_marker_mode` | str | How to persist directory markers: `none`, `empty`, or `nonempty` | `"empty"` |
+| `normalize_encoding_chars` | str | Characters to escape in S3 object keys as `!HH` hexadecimal bytes; empty string disables normalization | `"?#%+@"` |
 
 `directory_marker_mode` controls how RAGFS materializes directory objects in S3:
 
@@ -643,7 +956,12 @@ Typical choices:
 - For TOS or other VirtualHostStyle backends that reject zero-byte directory markers, use `nonempty`.
 - If you want pure prefix-style behavior and do not need persisted empty directories, use `none`.
 
-</details>
+`normalize_encoding_chars` controls which characters RAGFS rewrites before issuing S3 requests:
+
+- The default value is `"?#%+@"`, so only `?`, `#`, `%`, `+`, and `@` are escaped.
+- Escaped bytes are encoded as `!HH`, where `HH` is the uppercase hexadecimal value of the byte.
+- Characters not listed in `normalize_encoding_chars`, including Chinese and other Unicode characters, remain unchanged.
+- Set `normalize_encoding_chars` to `""` to keep original path segments in object keys.
 
 <details>
 <summary><b>PathStyle S3</b></summary>
@@ -659,7 +977,8 @@ Supports S3 storage in PathStyle mode, such as MinIO, SeaweedFS.
         "endpoint": "s3.amazonaws.com",
         "region": "us-east-1",
         "access_key": "your-ak",
-        "secret_key": "your-sk"
+        "secret_key": "your-sk",
+        "normalize_encoding_chars": "?#%+@"
       }
     }
   }
@@ -684,7 +1003,8 @@ Supports S3 storage in VirtualHostStyle mode, such as TOS.
         "access_key": "your-ak",
         "secret_key": "your-sk",
         "use_path_style": false,
-        "directory_marker_mode": "nonempty"
+        "directory_marker_mode": "nonempty",
+        "normalize_encoding_chars": "?#%+@"
       }
     }
   }
@@ -780,11 +1100,13 @@ For memory-related settings, add a `memory` section in `ov.conf`:
 
 | Field | Description | Default |
 |-------|-------------|---------|
-| `agent_scope_mode` | Agent memory namespace mode: `"user+agent"` isolates by `(user_id, agent_id)`, while `"agent"` isolates only by `agent_id` and shares agent memories across users of the same agent | `"user+agent"` |
+| `agent_scope_mode` | Deprecated and ignored. Kept only for backward compatibility with older `ov.conf` files. Agent/user namespace behavior is now controlled by per-account namespace policy. | `"user+agent"` |
 
-`agent_scope_mode` only affects agent-level namespaces such as `viking://agent/{agent_space}/memories/...`. User memories under `viking://user/{user_space}/memories/...` are not affected.
+`agent_scope_mode` no longer changes namespace behavior. The server now uses account-level namespace policy to choose between `viking://agent/{agent_id}/...` and `viking://agent/{agent_id}/user/{user_id}/...`.
 
 ### ovcli.conf
+
+You can edit this file by hand, or generate it interactively with `ov config setup-cli`. If you maintain configurations for multiple servers, switch between them with `ov config switch`.
 
 Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI to connect to a remote server:
 
@@ -795,8 +1117,8 @@ Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI t
   "account": "acme",
   "user": "alice",
   "agent_id": "my-agent",
-  "output": "table",
   "upload": {
+    "mode": "local",
     "ignore_dirs": "node_modules,.cache,.nx",
     "include": "*.md,*.pdf",
     "exclude": "*.tmp,*.log"
@@ -811,10 +1133,12 @@ Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI t
 | `account` | Default account sent as `X-OpenViking-Account` | `null` |
 | `user` | Default user sent as `X-OpenViking-User` | `null` |
 | `agent_id` | Agent identifier for agent space isolation | `null` |
-| `output` | Default output format: `"table"` or `"json"` | `"table"` |
 | `upload.ignore_dirs` | Default directory ignore list for `add-resource` (CSV) | `null` |
 | `upload.include` | Default include patterns for `add-resource` (CSV) | `null` |
 | `upload.exclude` | Default exclude patterns for `add-resource` (CSV) | `null` |
+| `upload.mode` | Temporary upload backend: `"local"` (per-instance disk) or `"shared"` (distributed shared store, required when consumer requests can land on a different server instance than the upload). Per-call override via `OPENVIKING_UPLOAD_MODE`. | `null` (server's `temp_upload.default_mode`, which itself defaults to `"local"`) |
+
+Local directory uploads respect `.gitignore` files (root and nested). `ignore_dirs/include/exclude` apply on top of that.
 
 CLI flags can override these identity fields per command:
 
@@ -839,22 +1163,30 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
 ```json
 {
   "server": {
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
     "port": 1933,
     "auth_mode": "api_key",
     "root_api_key": "your-secret-root-key",
-    "cors_origins": ["*"]
+    "cors_origins": ["*"],
+    "temp_upload": {
+      "default_mode": "local",
+      "shared_max_size_bytes": 536870912,
+      "shared_prefix": "viking://upload"
+    }
   }
 }
 ```
 
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|
-| `host` | str | Bind address | `0.0.0.0` |
+| `host` | str | Bind address | `127.0.0.1` |
 | `port` | int | Bind port | `1933` |
 | `auth_mode` | str | Authentication mode: `"api_key"` or `"trusted"`. Default is `"api_key"` | `"api_key"` |
 | `root_api_key` | str | Root API key for multi-tenant auth in `api_key` mode. In `trusted` mode it is optional on localhost, but required for any non-localhost deployment; it does not become the source of user identity | `null` |
 | `cors_origins` | list | Allowed CORS origins | `["*"]` |
+| `temp_upload.default_mode` | str | Server-side default for `POST /api/v1/resources/temp_upload` when the client does not send `upload_mode`: `"local"` (per-instance disk, current single-node behavior) or `"shared"` (distributed shared store usable across replicas). | `"local"` |
+| `temp_upload.shared_max_size_bytes` | int | Maximum size accepted in `shared` mode, in bytes. Requests above this size are rejected before object-store write. | `536870912` (512 MiB) |
+| `temp_upload.shared_prefix` | str | URI prefix used when allocating shared `temp_file_id` objects. | `"viking://upload"` |
 
 `api_key` mode uses API keys and is the default. `trusted` mode trusts `X-OpenViking-Account` / `X-OpenViking-User` headers from a trusted gateway or internal caller.
 
@@ -884,6 +1216,26 @@ Path locks are enabled by default and usually require no configuration. **The de
 
 For details on the lock mechanism, see [Path Locks and Crash Recovery](../concepts/09-transaction.md).
 
+## storage.task_tracker Section
+
+The task tracker records async task state for endpoints that return a `task_id` (task types include `session_commit`, `add_resource`, `add_skill`, and `admin_reindex`). The `persistent` backend stores task state on the workspace volume so that **a `task_id` returned by one instance can be looked up from another instance**, and task history survives a restart. The default `memory` backend keeps task state per process — sufficient for single-instance deployments.
+
+```json
+{
+  "storage": {
+    "task_tracker": {
+      "backend": "memory"
+    }
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `backend` | str | Task tracker backend. `"memory"` keeps task state in process memory (single-instance). `"persistent"` enables cross-instance task lookup and survives restarts. | `"memory"` |
+
+Set `backend` to `"persistent"` for multi-instance deployments where callers may poll `GET /api/v1/tasks/{task_id}` from any instance, or when task history needs to outlive the process.
+
 ## encryption Section
 
 Enable at-rest data encryption to ensure data security and isolation in multi-tenant environments. Encryption is completely transparent to users with no API changes.
@@ -901,6 +1253,7 @@ Enable at-rest data encryption to ensure data security and isolation in multi-te
 |-----------|------|-------------|---------|
 | `enabled` | bool | Whether encryption is enabled | `false` |
 | `provider` | str | Key provider: `"local"`, `"vault"`, or `"volcengine_kms"` | - |
+| `api_key_hashing.enabled` | bool | Whether to apply Argon2id one-way hashing to API key values (independent of file-level `enabled`); see [Encryption Guide](./08-encryption.md) | `false` |
 
 ### Local (File)
 
@@ -983,12 +1336,15 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
   "embedding": {
     "max_concurrent": 10,
     "max_retries": 3,
+    "text_source": "content_only",
+    "max_input_tokens": 4096,
     "dense": {
       "provider": "volcengine",
       "api_key": "string",
       "model": "string",
       "dimension": 1024,
-      "input": "multimodal"
+      "input": "multimodal",
+      "encoding_format": "float|base64"
     }
   },
   "vlm": {
@@ -1000,6 +1356,7 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "max_concurrent": 100,
     "max_retries": 3,
     "extra_headers": {},
+    "extra_request_body": {},
     "stream": false
   },
   "rerank": {
@@ -1009,6 +1366,10 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "api_base": "string",
     "threshold": 0.1,
     "extra_headers": {}
+  },
+  "retrieval": {
+    "hotness_alpha": 0.0,
+    "score_propagation_alpha": 1.0
   },
   "encryption": {
     "enabled": false,
@@ -1049,7 +1410,7 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "code_summary_mode": "ast"
   },
   "server": {
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
     "port": 1933,
     "root_api_key": "string",
     "cors_origins": ["*"]

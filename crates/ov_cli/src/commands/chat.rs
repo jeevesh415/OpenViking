@@ -15,6 +15,7 @@ use rustyline::error::ReadlineError;
 use serde::{Deserialize, Serialize};
 use termimad::MadSkin;
 
+use crate::config::Config;
 use crate::utils;
 
 use crate::error::{Error, Result};
@@ -33,12 +34,20 @@ pub struct ChatCommand {
     #[arg(short, long, env = "VIKINGBOT_API_KEY")]
     pub api_key: Option<String>,
 
+    /// Account identifier to send as X-OpenViking-Account
+    #[arg(long)]
+    pub account: Option<String>,
+
+    /// User identifier to send as X-OpenViking-User
+    #[arg(long)]
+    pub user: Option<String>,
+
     /// Session ID to use (creates new if not provided)
     #[arg(short, long)]
     pub session: Option<String>,
 
     /// Sender ID
-    #[arg(short, long, default_value = "user")]
+    #[arg(long, default_value = "user")]
     pub sender: String,
 
     /// Non-interactive mode (single message)
@@ -84,6 +93,8 @@ struct ChatResponse {
     session_id: String,
     message: String,
     #[serde(default)]
+    response_id: Option<String>,
+    #[serde(default)]
     events: Option<Vec<serde_json::Value>>,
 }
 
@@ -95,9 +106,16 @@ struct ChatStreamEvent {
     timestamp: Option<String>,
 }
 
+struct ChatAuth {
+    api_key: Option<String>,
+    account: Option<String>,
+    user: Option<String>,
+}
+
 impl ChatCommand {
     /// Execute the chat command
     pub async fn execute(&self) -> Result<()> {
+        let auth = self.resolve_auth()?;
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -105,24 +123,55 @@ impl ChatCommand {
 
         if let Some(message) = &self.message {
             // Single message mode
-            self.send_message(&client, message).await
+            self.send_message(&client, message, &auth).await
         } else {
             // Interactive mode
-            self.run_interactive(&client).await
+            self.run_interactive(&client, &auth).await
         }
     }
 
+    fn resolve_auth(&self) -> Result<ChatAuth> {
+        let config = Config::load()?;
+        Ok(ChatAuth {
+            api_key: self.api_key.clone().or(config.api_key),
+            account: self.account.clone().or(config.account),
+            user: self.user.clone().or(config.user),
+        })
+    }
+
+    fn apply_auth_headers(
+        &self,
+        mut req_builder: reqwest::RequestBuilder,
+        auth: &ChatAuth,
+    ) -> reqwest::RequestBuilder {
+        if let Some(api_key) = &auth.api_key {
+            req_builder = req_builder.header("X-API-Key", api_key);
+        }
+        if let Some(account) = &auth.account {
+            req_builder = req_builder.header("X-OpenViking-Account", account);
+        }
+        if let Some(user) = &auth.user {
+            req_builder = req_builder.header("X-OpenViking-User", user);
+        }
+        req_builder
+    }
+
     /// Send a single message and get response
-    async fn send_message(&self, client: &Client, message: &str) -> Result<()> {
+    async fn send_message(&self, client: &Client, message: &str, auth: &ChatAuth) -> Result<()> {
         if self.stream {
-            self.send_message_stream(client, message).await
+            self.send_message_stream(client, message, auth).await
         } else {
-            self.send_message_non_stream(client, message).await
+            self.send_message_non_stream(client, message, auth).await
         }
     }
 
     /// Send a single message with non-streaming response
-    async fn send_message_non_stream(&self, client: &Client, message: &str) -> Result<()> {
+    async fn send_message_non_stream(
+        &self,
+        client: &Client,
+        message: &str,
+        auth: &ChatAuth,
+    ) -> Result<()> {
         let url = format!("{}/chat", self.endpoint);
 
         let request = ChatRequest {
@@ -133,11 +182,7 @@ impl ChatCommand {
             context: None,
         };
 
-        let mut req_builder = client.post(&url).json(&request);
-
-        if let Some(api_key) = &self.api_key {
-            req_builder = req_builder.header("X-API-Key", api_key);
-        }
+        let req_builder = self.apply_auth_headers(client.post(&url).json(&request), auth);
 
         let response = req_builder
             .send()
@@ -165,7 +210,12 @@ impl ChatCommand {
     }
 
     /// Send a single message with streaming response
-    async fn send_message_stream(&self, client: &Client, message: &str) -> Result<()> {
+    async fn send_message_stream(
+        &self,
+        client: &Client,
+        message: &str,
+        auth: &ChatAuth,
+    ) -> Result<()> {
         let url = format!("{}/chat/stream", self.endpoint);
 
         let request = ChatRequest {
@@ -176,11 +226,7 @@ impl ChatCommand {
             context: None,
         };
 
-        let mut req_builder = client.post(&url).json(&request);
-
-        if let Some(api_key) = &self.api_key {
-            req_builder = req_builder.header("X-API-Key", api_key);
-        }
+        let req_builder = self.apply_auth_headers(client.post(&url).json(&request), auth);
 
         let response = req_builder
             .send()
@@ -197,6 +243,7 @@ impl ChatCommand {
         let mut response = response;
         let mut buffer = String::new();
         let mut final_message = String::new();
+        let mut response_id: Option<String> = None;
 
         while let Some(chunk) = response
             .chunk()
@@ -223,10 +270,13 @@ impl ChatCommand {
                             if let Some(msg) = event.data.as_str() {
                                 final_message = msg.to_string();
                             } else if let Some(obj) = event.data.as_object() {
-                                if let Some(msg) = obj.get("message").and_then(|m| m.as_str()) {
+                                if let Some(msg) = obj.get("content").and_then(|m| m.as_str()) {
                                     final_message = msg.to_string();
-                                } else if let Some(err) = obj.get("error").and_then(|e| e.as_str())
-                                {
+                                }
+                                if let Some(rid) = obj.get("response_id").and_then(|r| r.as_str()) {
+                                    response_id = Some(rid.to_string());
+                                }
+                                if let Some(err) = obj.get("error").and_then(|e| e.as_str()) {
                                     eprintln!("\x1b[1;31mError: {}\x1b[0m", err);
                                 }
                             }
@@ -234,6 +284,10 @@ impl ChatCommand {
                     }
                 }
             }
+        }
+
+        if let Some(response_id) = response_id {
+            eprintln!("\x1b[2mResponse ID: {}\x1b[0m", response_id);
         }
 
         // Print final response with markdown if we have it
@@ -246,7 +300,7 @@ impl ChatCommand {
     }
 
     /// Run interactive chat mode with rustyline
-    async fn run_interactive(&self, client: &Client) -> Result<()> {
+    async fn run_interactive(&self, client: &Client, auth: &ChatAuth) -> Result<()> {
         println!("Vikingbot Chat - Interactive Mode");
         println!("Endpoint: {}", self.endpoint);
         if let Some(session) = &self.session {
@@ -296,7 +350,7 @@ impl ChatCommand {
 
                     // Send message
                     match self
-                        .send_interactive_message(client, input, &mut session_id)
+                        .send_interactive_message(client, input, &mut session_id, auth)
                         .await
                     {
                         Ok(_) => {}
@@ -336,12 +390,13 @@ impl ChatCommand {
         client: &Client,
         input: &str,
         session_id: &mut Option<String>,
+        auth: &ChatAuth,
     ) -> Result<()> {
         if self.stream {
-            self.send_interactive_message_stream(client, input, session_id)
+            self.send_interactive_message_stream(client, input, session_id, auth)
                 .await
         } else {
-            self.send_interactive_message_non_stream(client, input, session_id)
+            self.send_interactive_message_non_stream(client, input, session_id, auth)
                 .await
         }
     }
@@ -352,6 +407,7 @@ impl ChatCommand {
         client: &Client,
         input: &str,
         session_id: &mut Option<String>,
+        auth: &ChatAuth,
     ) -> Result<()> {
         let url = format!("{}/chat", self.endpoint);
 
@@ -363,11 +419,7 @@ impl ChatCommand {
             context: None,
         };
 
-        let mut req_builder = client.post(&url).json(&request);
-
-        if let Some(api_key) = &self.api_key {
-            req_builder = req_builder.header("X-API-Key", api_key);
-        }
+        let req_builder = self.apply_auth_headers(client.post(&url).json(&request), auth);
 
         let response = req_builder
             .send()
@@ -407,22 +459,20 @@ impl ChatCommand {
         client: &Client,
         input: &str,
         session_id: &mut Option<String>,
+        auth: &ChatAuth,
     ) -> Result<()> {
         let url = format!("{}/chat/stream", self.endpoint);
+        let request_session_id = session_id.clone().or_else(|| self.session.clone());
 
         let request = ChatRequest {
             message: input.to_string(),
-            session_id: session_id.clone(),
+            session_id: request_session_id.clone(),
             user_id: Some(self.sender.clone()),
             stream: true,
             context: None,
         };
 
-        let mut req_builder = client.post(&url).json(&request);
-
-        if let Some(api_key) = &self.api_key {
-            req_builder = req_builder.header("X-API-Key", api_key);
-        }
+        let req_builder = self.apply_auth_headers(client.post(&url).json(&request), auth);
 
         let response = req_builder
             .send()
@@ -435,11 +485,14 @@ impl ChatCommand {
             return Err(Error::Api(format!("Request failed ({}): {}", status, text)));
         }
 
-        // Process the SSE stream
         let mut response = response;
         let mut buffer = String::new();
         let mut final_message = String::new();
-        let mut got_session_id = false;
+        let mut response_id: Option<String> = None;
+
+        if session_id.is_none() {
+            *session_id = request_session_id;
+        }
 
         while let Some(chunk) = response
             .chunk()
@@ -461,25 +514,18 @@ impl ChatCommand {
                 // Parse SSE line: "data: {json}"
                 if let Some(data_str) = line.strip_prefix("data: ") {
                     if let Ok(event) = serde_json::from_str::<ChatStreamEvent>(data_str) {
-                        // Extract session_id from first response event if needed
-                        if !got_session_id && session_id.is_none() {
-                            if let Some(obj) = event.data.as_object() {
-                                if let Some(sid) = obj.get("session_id").and_then(|s| s.as_str()) {
-                                    *session_id = Some(sid.to_string());
-                                    got_session_id = true;
-                                }
-                            }
-                        }
-
                         self.print_stream_event(&event);
                         if event.event == "response" {
                             if let Some(msg) = event.data.as_str() {
                                 final_message = msg.to_string();
                             } else if let Some(obj) = event.data.as_object() {
-                                if let Some(msg) = obj.get("message").and_then(|m| m.as_str()) {
+                                if let Some(msg) = obj.get("content").and_then(|m| m.as_str()) {
                                     final_message = msg.to_string();
-                                } else if let Some(err) = obj.get("error").and_then(|e| e.as_str())
-                                {
+                                }
+                                if let Some(rid) = obj.get("response_id").and_then(|r| r.as_str()) {
+                                    response_id = Some(rid.to_string());
+                                }
+                                if let Some(err) = obj.get("error").and_then(|e| e.as_str()) {
                                     eprintln!("\x1b[1;31mError: {}\x1b[0m", err);
                                 }
                             }
@@ -487,6 +533,10 @@ impl ChatCommand {
                     }
                 }
             }
+        }
+
+        if let Some(response_id) = response_id {
+            eprintln!("\x1b[2mResponse ID: {}\x1b[0m", response_id);
         }
 
         // Print final response with markdown
@@ -641,6 +691,8 @@ impl ChatCommand {
         Self {
             endpoint,
             api_key,
+            account: None,
+            user: None,
             session,
             sender,
             message,

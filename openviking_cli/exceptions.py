@@ -37,6 +37,7 @@ class InvalidURIError(InvalidArgumentError):
         if reason:
             message += f" ({reason})"
         super().__init__(message, details={"uri": uri, "reason": reason})
+        self.code = "INVALID_URI"
 
 
 class UnsupportedDirectoryFilesError(InvalidArgumentError):
@@ -54,10 +55,13 @@ class NotFoundError(OpenVikingError):
     """Resource not found."""
 
     def __init__(self, resource: str, resource_type: str = "resource"):
-        message = f"{resource_type.capitalize()} not found: {resource}"
-        super().__init__(
-            message, code="NOT_FOUND", details={"resource": resource, "type": resource_type}
-        )
+        details = {"type": resource_type}
+        if resource:
+            details["resource"] = resource
+            message = f"{resource_type.capitalize()} not found: {resource}"
+        else:
+            message = f"{resource_type.capitalize()} not found"
+        super().__init__(message, code="NOT_FOUND", details=details)
 
 
 class AlreadyExistsError(OpenVikingError):
@@ -83,6 +87,13 @@ class FailedPreconditionError(OpenVikingError):
 
     def __init__(self, message: str, details: Optional[dict] = None):
         super().__init__(message, code="FAILED_PRECONDITION", details=details)
+
+
+class AbortedError(OpenVikingError):
+    """Operation was aborted, typically due to a concurrency conflict."""
+
+    def __init__(self, message: str = "Operation aborted", details: Optional[dict] = None):
+        super().__init__(message, code="ABORTED", details=details)
 
 
 # ============= Authentication Errors =============
@@ -118,6 +129,13 @@ class UnavailableError(OpenVikingError):
         )
 
 
+class ResourceExhaustedError(OpenVikingError):
+    """Resource quota, rate limit, or billing capacity was exhausted."""
+
+    def __init__(self, message: str = "Resource exhausted", details: Optional[dict] = None):
+        super().__init__(message, code="RESOURCE_EXHAUSTED", details=details)
+
+
 class InternalError(OpenVikingError):
     """Internal server error."""
 
@@ -136,6 +154,13 @@ class DeadlineExceededError(OpenVikingError):
         super().__init__(
             message, code="DEADLINE_EXCEEDED", details={"operation": operation, "timeout": timeout}
         )
+
+
+class UnimplementedError(OpenVikingError):
+    """Operation is not implemented."""
+
+    def __init__(self, message: str = "Operation not implemented", details: Optional[dict] = None):
+        super().__init__(message, code="UNIMPLEMENTED", details=details)
 
 
 # ============= Business Errors =============

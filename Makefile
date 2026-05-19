@@ -27,15 +27,17 @@ CLEAN_DIRS := \
 	**/__pycache__/
 
 .PHONY: all build clean help check-pip check-deps
+.PHONY: build-cli
 
 all: build
 
 help:
 	@echo "Available targets:"
-	@echo "  build       - Build ragfs-python and C++ extensions using setup.py"
-	@echo "  clean       - Remove build artifacts and temporary files"
-	@echo "  check-deps  - Check if required dependencies (Rust, CMake, etc.) are installed"
-	@echo "  help        - Show this help message"
+	@echo "  build           - Build ragfs-python and C++ extensions using setup.py"
+	@echo "  build-cli       - Build Rust CLI (ov) in development mode (fast) and copy to openviking/bin/"
+	@echo "  clean           - Remove build artifacts and temporary files"
+	@echo "  check-deps      - Check if required dependencies (Rust, CMake, etc.) are installed"
+	@echo "  help            - Show this help message"
 
 check-pip:
 	@if command -v uv > /dev/null 2>&1 && uv pip --help > /dev/null 2>&1; then \
@@ -100,22 +102,23 @@ build: check-deps check-pip
 	fi; \
 	if [ -n "$$MATURIN_CMD" ]; then \
 		TMPDIR=$$(mktemp -d); \
-		cd crates/ragfs-python && $$MATURIN_CMD build --release --features s3 --out "$$TMPDIR" 2>&1; \
+		cd crates/ragfs-python && $$MATURIN_CMD build --release --out "$$TMPDIR" 2>&1; \
 		cd ../..; \
 		mkdir -p openviking/lib; \
+		rm -f openviking/lib/ragfs_python*.so openviking/lib/ragfs_python*.pyd openviking/lib/ragfs_python*.dylib; \
 		echo "import zipfile, glob, shutil, os, sys" > /tmp/extract_ragfs.py; \
 		echo "whls = glob.glob(os.path.join('$$TMPDIR', 'ragfs_python-*.whl'))" >> /tmp/extract_ragfs.py; \
 		echo "assert whls, 'maturin produced no wheel'" >> /tmp/extract_ragfs.py; \
 		echo "with zipfile.ZipFile(whls[0]) as zf:" >> /tmp/extract_ragfs.py; \
 		echo "    for name in zf.namelist():" >> /tmp/extract_ragfs.py; \
 		echo "        bn = os.path.basename(name)" >> /tmp/extract_ragfs.py; \
-		echo "        if bn.startswith('ragfs_python') and (bn.endswith('.so') or bn.endswith('.pyd')):" >> /tmp/extract_ragfs.py; \
+		echo "        if bn.startswith('ragfs_python.abi3.') and (bn.endswith('.so') or bn.endswith('.pyd')):" >> /tmp/extract_ragfs.py; \
 		echo "            dst = os.path.join('openviking', 'lib', bn)" >> /tmp/extract_ragfs.py; \
 		echo "            with zf.open(name) as src, open(dst, 'wb') as f: f.write(src.read())" >> /tmp/extract_ragfs.py; \
 		echo "            os.chmod(dst, 0o755)" >> /tmp/extract_ragfs.py; \
 		echo "            print(f'  [OK] ragfs-python: extracted {bn} -> {dst}')" >> /tmp/extract_ragfs.py; \
 		echo "            sys.exit(0)" >> /tmp/extract_ragfs.py; \
-		echo "print('[Warning] No ragfs_python .so/.pyd found in wheel')" >> /tmp/extract_ragfs.py; \
+		echo "print('[Warning] No ragfs_python abi3 .so/.pyd found in wheel')" >> /tmp/extract_ragfs.py; \
 		echo "sys.exit(1)" >> /tmp/extract_ragfs.py; \
 		$(PYTHON) /tmp/extract_ragfs.py; \
 		rm -f /tmp/extract_ragfs.py; \
@@ -137,3 +140,13 @@ clean:
 	@find . -name "*.pyc" -delete
 	@find . -name "__pycache__" -type d -exec rm -rf {} +
 	@echo "Cleanup completed."
+
+# Rust CLI targets
+build-cli:
+	@echo "Building Rust CLI (ov) in development mode..."
+	@cd $(OV_CLI_DIR) && cargo build
+	@mkdir -p openviking/bin
+	@cp target/debug/ov openviking/bin/ov
+	@chmod +x openviking/bin/ov
+	@echo "  [OK] CLI built at target/debug/ov"
+	@echo "  [OK] CLI copied to openviking/bin/ov"

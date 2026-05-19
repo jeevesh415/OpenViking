@@ -6,7 +6,7 @@ Synchronous OpenViking client implementation.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from openviking.session import Session
@@ -39,14 +39,16 @@ class SyncOpenViking:
         """Check whether a session exists in storage."""
         return run_async(self._async_client.session_exists(session_id))
 
-    def create_session(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+    def create_session(
+        self, session_id: Optional[str] = None, telemetry: TelemetryRequest = False
+    ) -> Dict[str, Any]:
         """Create a new session.
 
         Args:
             session_id: Optional session ID. If provided, creates a session with the given ID.
                        If None, creates a new session with auto-generated ID.
         """
-        return run_async(self._async_client.create_session(session_id))
+        return run_async(self._async_client.create_session(session_id, telemetry=telemetry))
 
     def list_sessions(self) -> List[Any]:
         """List all sessions."""
@@ -77,6 +79,8 @@ class SyncOpenViking:
         content: str | None = None,
         parts: list[dict] | None = None,
         created_at: str | None = None,
+        role_id: str | None = None,
+        telemetry: TelemetryRequest = False,
     ) -> Dict[str, Any]:
         """Add a message to a session.
 
@@ -86,11 +90,20 @@ class SyncOpenViking:
             content: Text content (simple mode)
             parts: Parts array (full Part support: TextPart, ContextPart, ToolPart)
             created_at: Message creation time (ISO format string). If not provided, current time is used.
+            role_id: Optional explicit actor identity. Omit to let the client/server derive it.
 
         If both content and parts are provided, parts takes precedence.
         """
         return run_async(
-            self._async_client.add_message(session_id, role, content, parts, created_at)
+            self._async_client.add_message(
+                session_id,
+                role,
+                content,
+                parts,
+                created_at,
+                role_id,
+                telemetry,
+            )
         )
 
     def commit_session(
@@ -102,6 +115,21 @@ class SyncOpenViking:
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Query background task status."""
         return run_async(self._async_client.get_task(task_id))
+
+    def reindex(
+        self,
+        uri: str,
+        mode: str = "vectors_only",
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        """Reindex semantic/vector artifacts for a URI."""
+        return run_async(
+            self._async_client.reindex(
+                uri=uri,
+                mode=mode,
+                wait=wait,
+            )
+        )
 
     def add_resource(
         self,
@@ -120,6 +148,8 @@ class SyncOpenViking:
         """Add resource to OpenViking (resources scope only)
 
         Args:
+            to: Exact target URI. Existing targets keep the add_resource incremental-update behavior.
+            parent: Target parent URI for automatic child naming.
             build_index: Whether to build vector index immediately (default: True).
             summarize: Whether to generate summary (default: False).
             **kwargs: Extra options forwarded to the parser chain, e.g.
@@ -158,7 +188,7 @@ class SyncOpenViking:
     def search(
         self,
         query: str,
-        target_uri: str = "",
+        target_uri: Union[str, List[str]] = "",
         session: Optional["Session"] = None,
         session_id: Optional[str] = None,
         limit: int = 10,
@@ -168,6 +198,7 @@ class SyncOpenViking:
         since: Optional[str] = None,
         until: Optional[str] = None,
         time_field: Optional[str] = None,
+        level: Optional[List[int]] = None,
     ):
         """Execute complex retrieval (intent analysis, hierarchical retrieval)."""
         return run_async(
@@ -183,13 +214,14 @@ class SyncOpenViking:
                 since=since,
                 until=until,
                 time_field=time_field,
+                level=level,
             )
         )
 
     def find(
         self,
         query: str,
-        target_uri: str = "",
+        target_uri: Union[str, List[str]] = "",
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
@@ -197,6 +229,7 @@ class SyncOpenViking:
         since: Optional[str] = None,
         until: Optional[str] = None,
         time_field: Optional[str] = None,
+        level: Optional[List[int]] = None,
     ):
         """Quick retrieval"""
         return run_async(
@@ -210,6 +243,7 @@ class SyncOpenViking:
                 since,
                 until,
                 time_field,
+                level,
             )
         )
 
@@ -265,15 +299,49 @@ class SyncOpenViking:
         """Delete relation"""
         return run_async(self._async_client.unlink(from_uri, uri))
 
-    def export_ovpack(self, uri: str, to: str) -> str:
+    def export_ovpack(self, uri: str, to: str, include_vectors: bool = False) -> str:
         """Export .ovpack file"""
-        return run_async(self._async_client.export_ovpack(uri, to))
+        return run_async(self._async_client.export_ovpack(uri, to, include_vectors=include_vectors))
+
+    def backup_ovpack(self, to: str, include_vectors: bool = False) -> str:
+        """Back up public scopes as a restore-only .ovpack file."""
+        return run_async(self._async_client.backup_ovpack(to, include_vectors=include_vectors))
 
     def import_ovpack(
-        self, file_path: str, target: str, force: bool = False, vectorize: bool = True
+        self,
+        file_path: str,
+        target: str,
+        on_conflict: Optional[str] = None,
+        vector_mode: Optional[str] = None,
     ) -> str:
         """Import .ovpack file (triggers vectorization by default)"""
-        return run_async(self._async_client.import_ovpack(file_path, target, force, vectorize))
+        return run_async(
+            self._async_client.import_ovpack(
+                file_path,
+                target,
+                on_conflict=on_conflict,
+                vector_mode=vector_mode,
+            )
+        )
+
+    def restore_ovpack(
+        self,
+        file_path: str,
+        on_conflict: Optional[str] = None,
+        vector_mode: Optional[str] = None,
+    ) -> str:
+        """Restore backup .ovpack file."""
+        return run_async(
+            self._async_client.restore_ovpack(
+                file_path,
+                on_conflict=on_conflict,
+                vector_mode=vector_mode,
+            )
+        )
+
+    def check_consistency(self, uri: str) -> Dict[str, Any]:
+        """Check filesystem/vector-index consistency for a URI subtree."""
+        return run_async(self._async_client.check_consistency(uri))
 
     def close(self) -> None:
         """Close OpenViking and release resources."""

@@ -222,6 +222,43 @@ else
     log "⚠️  Rust toolchain setup failed, build may fail"
 fi
 
+log "[5.55/8] Checking maturin for ragfs-python build..."
+MATURIN_OK=false
+
+if python -c "import maturin" 2>/dev/null; then
+    MATURIN_VERSION=$(python -m maturin --version 2>/dev/null | awk '{print $2}' || echo "unknown")
+    log "✅ maturin is already available (Python module): $MATURIN_VERSION"
+    MATURIN_OK=true
+elif command -v maturin &> /dev/null; then
+    MATURIN_VERSION=$(maturin --version 2>/dev/null | awk '{print $2}' || echo "unknown")
+    log "✅ maturin is already available (CLI): $MATURIN_VERSION"
+    MATURIN_OK=true
+fi
+
+if [ "$MATURIN_OK" = false ]; then
+    log "maturin not found, installing..."
+    if command -v uv &> /dev/null && uv pip --help &> /dev/null; then
+        if uv pip install maturin 2>&1 | tee -a "$LOG_FILE"; then
+            log "✅ maturin installed via uv pip"
+            MATURIN_OK=true
+        fi
+    fi
+
+    if [ "$MATURIN_OK" = false ]; then
+        if pip install maturin 2>&1 | tee -a "$LOG_FILE"; then
+            log "✅ maturin installed via pip"
+            MATURIN_OK=true
+        else
+            log "⚠️  Failed to install maturin, ragfs-python will not be built"
+        fi
+    fi
+fi
+
+if [ "$MATURIN_OK" = true ]; then
+    MATURIN_VERSION=$(python -m maturin --version 2>/dev/null || maturin --version 2>/dev/null || echo "unknown")
+    log "maturin version: $MATURIN_VERSION"
+fi
+
 log "[5.6/8] Checking Python build dependencies..."
 
 # Check if setuptools-scm is already installed
@@ -280,7 +317,49 @@ for i in $(seq 1 $MAX_RETRIES); do
     log "Build attempt $i/$MAX_RETRIES..."
     
     if python setup.py build_ext --inplace 2>&1 | tee -a "$LOG_FILE"; then
-        log "build_ext completed, installing dependencies..."
+        log "build_ext completed"
+
+        RAGFS_LIB_DIR="$PROJECT_DIR/openviking/lib"
+        RAGFS_SO_COUNT=$(ls -1 "$RAGFS_LIB_DIR"/ragfs_python*.so "$RAGFS_LIB_DIR"/ragfs_python*.pyd "$RAGFS_LIB_DIR"/ragfs_python*.dylib 2>/dev/null | wc -l | xargs || echo "0")
+        if [ "$RAGFS_SO_COUNT" -eq 0 ] && [ "$MATURIN_OK" = true ] && [ -d "$PROJECT_DIR/crates/ragfs-python" ]; then
+            log "ragfs_python native lib not found after build_ext, building via maturin..."
+            TMPDIR_RAGFS=$(mktemp -d)
+            if (cd "$PROJECT_DIR/crates/ragfs-python" && python -m maturin build --release --features s3 --out "$TMPDIR_RAGFS" 2>&1 | tee -a "$LOG_FILE"); then
+                WHL_FILE=$(ls -1 "$TMPDIR_RAGFS"/ragfs_python-*.whl 2>/dev/null | head -1)
+                if [ -n "$WHL_FILE" ]; then
+                    mkdir -p "$RAGFS_LIB_DIR"
+                    python -c "
+import zipfile, os, sys, stat
+with zipfile.ZipFile('$WHL_FILE') as zf:
+    for name in zf.namelist():
+        bn = os.path.basename(name)
+        if bn.startswith('ragfs_python') and (bn.endswith('.so') or bn.endswith('.pyd') or bn.endswith('.dylib')):
+            dst = os.path.join('$RAGFS_LIB_DIR', bn)
+            with zf.open(name) as src, open(dst, 'wb') as f:
+                f.write(src.read())
+            os.chmod(dst, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+            print(f'  [OK] ragfs-python: extracted {bn} -> {dst}')
+            sys.exit(0)
+print('[ERROR] No ragfs_python native library found in wheel')
+sys.exit(1)
+" 2>&1 | tee -a "$LOG_FILE"
+                else
+                    log "⚠️  maturin produced no wheel"
+                fi
+            else
+                log "⚠️  maturin build failed, ragfs-python may not be available"
+            fi
+            rm -rf "$TMPDIR_RAGFS"
+        fi
+
+        RAGFS_SO_FINAL=$(ls -1 "$RAGFS_LIB_DIR"/ragfs_python*.so "$RAGFS_LIB_DIR"/ragfs_python*.pyd "$RAGFS_LIB_DIR"/ragfs_python*.dylib 2>/dev/null | head -1 || true)
+        if [ -n "$RAGFS_SO_FINAL" ]; then
+            log "✅ ragfs_python native extension verified: $RAGFS_SO_FINAL"
+        else
+            log "⚠️  WARNING: ragfs_python native extension not found in $RAGFS_LIB_DIR, server may fail to start"
+        fi
+
+        log "Installing dependencies..."
         UV_EXTRA_ARGS=""
         if [ -n "$GITHUB_WORKSPACE" ]; then
             UV_EXTRA_ARGS="--index-url https://pypi.tuna.tsinghua.edu.cn/simple"
@@ -418,6 +497,67 @@ fi
 
 rm -rf ~/.openclaw/cache/* 2>/dev/null || true
 rm -rf ~/.openclaw/tmp/* 2>/dev/null || true
+
+OC_CONF="$HOME/.openclaw/openclaw.json"
+if [ -f "$OC_CONF" ]; then
+    log "Fixing OpenClaw plugin config to avoid memory-core conflict..."
+    python3 -c "
+import json, sys
+try:
+    with open('$OC_CONF') as f:
+        cfg = json.load(f)
+    changed = False
+    plugins = cfg.setdefault('plugins', {})
+    entries = plugins.setdefault('entries', {})
+    if entries.get('memory-core', {}).get('enabled', True) is not False:
+        entries['memory-core'] = {'enabled': False}
+        changed = True
+    allow = plugins.get('allow', [])
+    if 'memory-core' in allow:
+        allow.remove('memory-core')
+        plugins['allow'] = allow
+        changed = True
+    plugin_paths = []
+    cwd = __import__('os').getcwd()
+    for p in ['/root/actions-runner/_work/OpenViking/OpenViking/examples/openclaw-plugin',
+              '/root/actions-runner-kaisong/_work/OpenViking/OpenViking/examples/openclaw-plugin']:
+        if __import__('os').path.isdir(p) and cwd.startswith(p.split('/examples/')[0]):
+            plugin_paths.append(p)
+            break
+    if not plugin_paths:
+        for p in ['/root/actions-runner/_work/OpenViking/OpenViking/examples/openclaw-plugin',
+                  '/root/actions-runner-kaisong/_work/OpenViking/OpenViking/examples/openclaw-plugin']:
+            if __import__('os').path.isdir(p):
+                plugin_paths.append(p)
+                break
+    if plugin_paths and plugins.get('load', {}).get('paths', []) != plugin_paths:
+        plugins.setdefault('load', {})['paths'] = plugin_paths
+        changed = True
+    hooks = cfg.setdefault('hooks', {}).setdefault('internal', {}).setdefault('entries', {})
+    if hooks.get('session-memory', {}).get('enabled', True) is not False:
+        hooks['session-memory'] = {'enabled': False}
+        changed = True
+    if changed:
+        with open('$OC_CONF', 'w') as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        print('✅ Fixed: memory-core disabled, session-memory disabled')
+    else:
+        print('✅ Plugin config OK, no changes needed')
+except Exception as e:
+    print(f'Config fix error: {e}', file=sys.stderr)
+" 2>&1 | tee -a "$LOG_FILE"
+fi
+
+SESSION_DIR=~/.openclaw/agents/main/sessions
+if [ -d "$SESSION_DIR" ]; then
+    SESSION_COUNT=$(find "$SESSION_DIR" -name "*.jsonl" -type f 2>/dev/null | wc -l)
+    if [ "$SESSION_COUNT" -gt 10 ]; then
+        log "⚠️  Found $SESSION_COUNT session files, cleaning old sessions to prevent context overflow..."
+        rm -rf "$SESSION_DIR"/*.jsonl
+        log "✅ Old session files cleaned"
+    fi
+fi
+
 log "✅ Pre-start cleanup completed (locks: $LOCK_COUNT, session locks: $SESSION_LOCK_COUNT, cache cleared)"
 
 # Step 3: Verify OpenViking installation path before starting
@@ -453,7 +593,20 @@ if [ "$OV_SERVER_RUNNING" = false ]; then
     log "OpenViking server not running, starting it..."
 
     pkill -f "openviking.server.bootstrap" 2>/dev/null || true
+    sleep 2
+
+    pkill -9 -f "openviking.server.bootstrap" 2>/dev/null || true
     sleep 1
+
+    if ss -tuln 2>/dev/null | grep -q ":1933 "; then
+        log "⚠️  Port 1933 still in use after killing OV processes, finding culprit..."
+        FUSER_OUT=$(fuser 1933/tcp 2>/dev/null || ss -tulnp 2>/dev/null | grep ":1933 " | grep -oP 'pid=\K[0-9]+' || true)
+        if [ -n "$FUSER_OUT" ]; then
+            log "Killing process(es) on port 1933: $FUSER_OUT"
+            echo "$FUSER_OUT" | xargs kill -9 2>/dev/null || true
+            sleep 2
+        fi
+    fi
 
     OV_CONF=""
     for conf_candidate in "$PROJECT_DIR/ov.conf.temp" "$PROJECT_DIR/ov.conf" "$HOME/.openviking/ov.conf"; do
@@ -501,6 +654,15 @@ except Exception as e:
     OV_PYTHON=$(command -v python 2>/dev/null || echo "python")
     log "Using Python: $OV_PYTHON ($($OV_PYTHON --version 2>&1))"
 
+    log "Cleaning context collection for fresh start..."
+    CONTEXT_DIR="/root/.openviking/data/vectordb/context"
+    if [ -d "$CONTEXT_DIR" ]; then
+        rm -rf "$CONTEXT_DIR"
+        log "✅ Cleaned context collection (will be regenerated on session commits)"
+    else
+        log "✅ No context collection to clean"
+    fi
+
     > /tmp/openviking.log
 
     if [ -n "$OV_CONF" ]; then
@@ -517,37 +679,113 @@ except Exception as e:
         sleep 3
         if ! kill -0 $OV_SERVER_PID 2>/dev/null; then
             log "⚠️  OpenViking server process (PID: $OV_SERVER_PID) exited prematurely after ${i}x3s"
+            log "   Last 30 lines of server log:"
+            tail -30 /tmp/openviking.log 2>/dev/null | tee -a "$LOG_FILE" || true
             break
         fi
+        PORT_LISTENING=false
         if command -v ss &> /dev/null; then
-            if ss -tuln 2>/dev/null | grep -q ":1933 "; then
-                OV_SERVER_RUNNING=true
-                log "✅ OpenViking server is listening on port 1933 (after ${i}x3s)"
-                break
-            fi
+            ss -tuln 2>/dev/null | grep -q ":1933 " && PORT_LISTENING=true
         elif command -v netstat &> /dev/null; then
-            if netstat -tuln 2>/dev/null | grep -q ":1933 "; then
+            netstat -tuln 2>/dev/null | grep -q ":1933 " && PORT_LISTENING=true
+        fi
+        if [ "$PORT_LISTENING" = true ]; then
+            HEALTH_RESP=$(curl -sf http://127.0.0.1:1933/health 2>/dev/null || echo "")
+            if echo "$HEALTH_RESP" | grep -qi "healthy\|ok\|running"; then
                 OV_SERVER_RUNNING=true
-                log "✅ OpenViking server is listening on port 1933 (after ${i}x3s)"
+                log "✅ OpenViking server is healthy on port 1933 (after ${i}x3s)"
                 break
+            elif [ $i -ge 10 ]; then
+                OV_SERVER_RUNNING=true
+                log "⚠️  OpenViking server is listening on port 1933 but /health not ready (after ${i}x3s), proceeding anyway"
+                break
+            else
+                log "   Port 1933 listening but /health not ready, waiting... (${i}x3s)"
             fi
         fi
     done
 
     if [ "$OV_SERVER_RUNNING" = false ]; then
         log "❌ ERROR: OpenViking server failed to start on port 1933"
-        log "   Server log:"
-        cat /tmp/openviking.log 2>/dev/null | tee -a "$LOG_FILE" || true
+        log "   Server log (last 50 lines):"
+        tail -50 /tmp/openviking.log 2>/dev/null | tee -a "$LOG_FILE" || true
         log ""
-        log "This likely indicates a data compatibility issue between the new code"
-        log "and existing vectordb data. Check the error above for details."
-        log "Do NOT delete /root/.openviking/data/ - this error should be reported and fixed."
-        log "Caches, build artifacts, and temp files are safe to clean."
-        exit 1
+        log "Attempting server restart with --reset-sessions flag..."
+        pkill -f "openviking.server.bootstrap" 2>/dev/null || true
+        sleep 2
+
+        nohup $OV_PYTHON -u -m openviking.server.bootstrap ${OV_CONF:+--config "$OV_CONF"} > /tmp/openviking.log 2>&1 &
+        OV_SERVER_PID=$!
+        log "Restarted OpenViking server (PID: $OV_SERVER_PID)"
+
+        for i in $(seq 1 15); do
+            sleep 3
+            if ! kill -0 $OV_SERVER_PID 2>/dev/null; then
+                log "⚠️  Restarted server also exited after ${i}x3s"
+                break
+            fi
+            PORT_LISTENING=false
+            ss -tuln 2>/dev/null | grep -q ":1933 " && PORT_LISTENING=true
+            netstat -tuln 2>/dev/null | grep -q ":1933 " && PORT_LISTENING=true
+            if [ "$PORT_LISTENING" = true ]; then
+                HEALTH_RESP=$(curl -sf http://127.0.0.1:1933/health 2>/dev/null || echo "")
+                if echo "$HEALTH_RESP" | grep -qi "healthy\|ok\|running"; then
+                    OV_SERVER_RUNNING=true
+                    log "✅ Restarted server is healthy on port 1933 (after ${i}x3s)"
+                    break
+                elif [ $i -ge 8 ]; then
+                    OV_SERVER_RUNNING=true
+                    log "⚠️  Restarted server listening on port 1933 but /health not ready (after ${i}x3s), proceeding anyway"
+                    break
+                else
+                    log "   Restarted: port 1933 listening but /health not ready, waiting... (${i}x3s)"
+                fi
+            fi
+        done
+
+        if [ "$OV_SERVER_RUNNING" = false ]; then
+            log "   Server log (last 50 lines after restart):"
+            tail -50 /tmp/openviking.log 2>/dev/null | tee -a "$LOG_FILE" || true
+            log ""
+            log "This likely indicates a data compatibility issue between the new code"
+            log "and existing vectordb data. Check the error above for details."
+            log "Do NOT delete /root/.openviking/data/ - this error should be reported and fixed."
+            log "Caches, build artifacts, and temp files are safe to clean."
+            exit 1
+        fi
     fi
 fi
 
-# Step 4: Start OpenClaw gateway
+# Step 4: Clean up stale OV sessions with failed archives
+log "Cleaning up stale OV sessions..."
+OV_API_KEY=$(python3 -c "
+import json
+try:
+    with open('$OC_CONF') as f:
+        cfg = json.load(f)
+    print(cfg.get('plugins',{}).get('entries',{}).get('openviking',{}).get('config',{}).get('apiKey','test-root-api-key'))
+except:
+    print('test-root-api-key')
+" 2>/dev/null || echo "test-root-api-key")
+curl -sf http://127.0.0.1:1933/api/v1/sessions -H "X-API-Key: $OV_API_KEY" 2>/dev/null | python3 -c "
+import json, sys, urllib.request
+try:
+    data = json.load(sys.stdin)
+    sessions = data.get('result', [])
+    deleted = 0
+    for s in sessions:
+        sid = s.get('session_id', '')
+        if sid:
+            req = urllib.request.Request(f'http://127.0.0.1:1933/api/v1/sessions/{sid}', method='DELETE')
+            req.add_header('X-API-Key', '$OV_API_KEY')
+            urllib.request.urlopen(req, timeout=5)
+            deleted += 1
+    print(f'✅ Cleaned {deleted} stale sessions')
+except Exception as e:
+    print(f'⚠️  Session cleanup skipped: {e}')
+" 2>&1 | tee -a "$LOG_FILE"
+
+# Step 5: Start OpenClaw gateway
 RESTART_SUCCESS=false
 for i in $(seq 1 $MAX_RETRIES); do
     log "Step 4: Starting OpenClaw gateway (attempt $i/$MAX_RETRIES)..."

@@ -19,12 +19,14 @@ class OpenVikingAPIClient:
         api_key: Optional[str] = None,
         account: Optional[str] = None,
         user: Optional[str] = None,
+        agent: Optional[str] = None,
     ):
         self.base_url = base_url or Config.CONSOLE_URL
         self.server_url = server_url or Config.SERVER_URL
         self.api_key = api_key or Config.OPENVIKING_API_KEY
         self.account = account or Config.OPENVIKING_ACCOUNT
         self.user = user or Config.OPENVIKING_USER
+        self.agent = agent or Config.OPENVIKING_AGENT
         self.session = requests.Session()
         self._setup_default_headers()
         self.max_retries = 3
@@ -108,6 +110,7 @@ class OpenVikingAPIClient:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "X-OpenViking-Account": self.account,
             "X-OpenViking-User": self.user,
+            "X-OpenViking-Agent": self.agent,
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -253,6 +256,8 @@ class OpenVikingAPIClient:
         path: str,
         to: Optional[str] = None,
         reason: Optional[str] = None,
+        parent: Optional[str] = None,
+        instruction: Optional[str] = None,
         wait: bool = False,
     ) -> requests.Response:
         endpoint = "/api/v1/resources"
@@ -270,6 +275,10 @@ class OpenVikingAPIClient:
             payload["to"] = to
         if reason:
             payload["reason"] = reason
+        if parent:
+            payload["parent"] = parent
+        if instruction:
+            payload["instruction"] = instruction
         if wait:
             payload["wait"] = wait
         try:
@@ -312,10 +321,19 @@ class OpenVikingAPIClient:
         url = self._build_url(self.server_url, endpoint)
         return self._request_with_retry("DELETE", url)
 
-    def add_message(self, session_id: str, role: str, content: str) -> requests.Response:
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        role_id: Optional[str] = None,
+    ) -> requests.Response:
         endpoint = f"/api/v1/sessions/{session_id}/messages"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("POST", url, json={"role": role, "content": content})
+        payload = {"role": role, "content": content}
+        if role_id is not None:
+            payload["role_id"] = role_id
+        return self._request_with_retry("POST", url, json=payload)
 
     def fs_ls(self, uri: str, simple: bool = False, recursive: bool = False) -> requests.Response:
         endpoint = "/api/v1/fs/ls"
@@ -413,13 +431,18 @@ class OpenVikingAPIClient:
         return response
 
     def import_ovpack(
-        self, file_path: str, parent: str, force: bool = False, vectorize: bool = True
+        self,
+        file_path: str,
+        parent: str,
+        on_conflict: str | None = None,
     ) -> requests.Response:
         endpoint = "/api/v1/pack/import"
         url = self._build_url(self.server_url, endpoint)
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"Local ovpack file not found: {file_path}")
-        payload = {"parent": parent, "force": force, "vectorize": vectorize}
+        payload = {"parent": parent}
+        if on_conflict is not None:
+            payload["on_conflict"] = on_conflict
         payload["temp_file_id"] = self._upload_temp_file(file_path)
         return self._request_with_retry(
             "POST",
@@ -586,6 +609,42 @@ class OpenVikingAPIClient:
         if timeout is not None:
             payload["timeout"] = timeout
         return self._request_with_retry("POST", url, json=payload)
+
+    def content_reindex(
+        self,
+        uri: str,
+        regenerate: bool = False,
+        wait: bool = True,
+    ) -> requests.Response:
+        mode = "full" if regenerate else "vectors_only"
+        endpoint = "/api/v1/content/reindex"
+        url = self._build_url(self.server_url, endpoint)
+        payload = {"uri": uri, "mode": mode, "wait": wait}
+        return self._request_with_retry("POST", url, json=payload)
+
+    def content_download(self, uri: str) -> requests.Response:
+        endpoint = "/api/v1/content/download"
+        params = {"uri": uri}
+        url = self._build_url(self.server_url, endpoint, params)
+        return self._request_with_retry("GET", url)
+
+    def list_tasks(
+        self,
+        task_type: Optional[str] = None,
+        status: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> requests.Response:
+        endpoint = "/api/v1/tasks"
+        params = {"limit": limit}
+        if task_type:
+            params["task_type"] = task_type
+        if status:
+            params["status"] = status
+        if resource_id:
+            params["resource_id"] = resource_id
+        url = self._build_url(self.server_url, endpoint, params)
+        return self._request_with_retry("GET", url)
 
     def close(self):
         self.session.close()

@@ -41,6 +41,12 @@ from openviking.storage.vectordb.utils.constants import (
 from openviking.storage.vectordb.utils.data_processor import DataProcessor
 from openviking.storage.vectordb.utils.dict_utils import ThreadSafeDictManager
 from openviking.storage.vectordb.utils.id_generator import generate_auto_id
+from openviking.storage.vectordb.utils.json_safety import safe_json_dumps
+from openviking.storage.vectordb.utils.path_safety import (
+    resolve_storage_path,
+    safe_join,
+    safe_join_name,
+)
 from openviking.storage.vectordb.utils.str_to_uint64 import str_to_uint64
 from openviking.storage.vectordb.vectorize.base import BaseVectorizer
 from openviking.storage.vectordb.vectorize.vectorizer import VectorizerAdapter
@@ -107,18 +113,19 @@ def get_or_create_local_collection(
         )
         return Collection(collection)
     else:
-        os.makedirs(path, exist_ok=True)
-        meta_path = os.path.join(path, "collection_meta.json")
+        collection_dir = str(resolve_storage_path(path))
+        os.makedirs(collection_dir, exist_ok=True)
+        meta_path = str(safe_join(collection_dir, "collection_meta.json"))
         meta = create_collection_meta(meta_path, meta_data)
         vectorizer = (
             VectorizerFactory.create(meta.vectorize)
             if meta.vectorize and vectorizer is None
             else vectorizer
         )
-        storage_path = os.path.join(path, STORAGE_DIR_NAME)
+        storage_path = str(safe_join(collection_dir, STORAGE_DIR_NAME))
         store_mgr = create_store_manager("local", storage_path)
         collection = PersistCollection(
-            path=path, meta=meta, store=store_mgr, vectorizer=vectorizer, config=config
+            path=collection_dir, meta=meta, store=store_mgr, vectorizer=vectorizer, config=config
         )
         return Collection(collection)
 
@@ -358,7 +365,9 @@ class LocalCollection(ICollection):
             return SearchResult()
         cands = cands_list[0]
         sparse_vector = (
-            dict(zip(cands.sparse_raw_terms, cands.sparse_values)) if cands.sparse_raw_terms else {}
+            dict(zip(cands.sparse_raw_terms, cands.sparse_values, strict=False))
+            if cands.sparse_raw_terms
+            else {}
         )
 
         return self.search_by_vector(
@@ -560,7 +569,7 @@ class LocalCollection(ICollection):
                     if sparse_dict and isinstance(sparse_dict, dict):
                         cands_list[i].sparse_raw_terms = list(sparse_dict.keys())
                         cands_list[i].sparse_values = list(sparse_dict.values())
-            cands_list[i].fields = json.dumps(data)
+            cands_list[i].fields = safe_json_dumps(data, ensure_ascii=False)
             cands_list[i].expire_ns_ts = time.time_ns() + ttl * 1000000000 if ttl > 0 else 0
 
         if not self.store_mgr:
@@ -607,7 +616,9 @@ class LocalCollection(ICollection):
             if not self.vectorizer_adapter:
                 raw_data[vk] = list(cand_data.vector)
                 if svk and cand_data.sparse_raw_terms and cand_data.sparse_values:
-                    raw_data[svk] = dict(zip(cand_data.sparse_raw_terms, cand_data.sparse_values))
+                    raw_data[svk] = dict(
+                        zip(cand_data.sparse_raw_terms, cand_data.sparse_values, strict=False)
+                    )
             raw_data = validation.fix_fields_data(raw_data, self.meta.fields_dict)
             raw_data_list.append(raw_data)
 
@@ -927,28 +938,50 @@ class PersistCollection(LocalCollection):
         vectorizer: Optional[BaseVectorizer] = None,
         config: Optional[Dict[str, Any]] = None,
     ):
-        self.collection_dir = path
+        self.collection_dir = str(resolve_storage_path(path))
         os.makedirs(self.collection_dir, exist_ok=True)
-        self.index_dir = os.path.join(self.collection_dir, "index")
+        self.index_dir = str(safe_join(self.collection_dir, "index"))
         os.makedirs(self.index_dir, exist_ok=True)
         super().__init__(meta, store, vectorizer, config)
         self._recover()
         LocalCollection._register_scheduler_job(self)  # TTL expiration data cleanup
 
     def _recover(self):
-        index_names = [
-            folder
-            for folder in os.listdir(self.index_dir)
-            if os.path.isdir(os.path.join(self.index_dir, folder))
-        ]
-        for index_name in index_names:
-            meta_path = os.path.join(self.index_dir, index_name, "index_meta.json")
-            if not os.path.exists(meta_path):
+        index_count = 0
+        for f in os.listdir(self.index_dir):
+            try:
+                if safe_join(self.index_dir, f).is_dir():
+                    index_count += 1
+            except ValueError:
+                pass
+        if index_count > 0:
+            logger.info("Recovering %d index(es) from %s", index_count, self.index_dir)
+        for folder in os.listdir(self.index_dir):
+            try:
+                index_dir = safe_join(self.index_dir, folder)
+            except ValueError:
+                logger.warning(f"Skipping invalid index directory under {self.index_dir}: {folder}")
+                continue
+
+            if not index_dir.is_dir():
+                continue
+
+            try:
+                validation.validate_name_str(folder)
+            except ValueError:
+                logger.warning(
+                    f"Skipping index directory with invalid name under {self.index_dir}: {folder}"
+                )
+                continue
+
+            index_name = folder
+            meta_path = safe_join(index_dir, "index_meta.json")
+            if not meta_path.exists():
                 logger.warning(
                     f"Index metadata file not found at {meta_path}, skipping recovery for index {index_name}"
                 )
                 continue
-            meta = create_index_meta(self.meta, meta_path)
+            meta = create_index_meta(self.meta, str(meta_path))
             # When recovering an existing index, pass initial_timestamp=0.
             # This ensures the index's base version starts at 0, allowing it to ingest
             # all data from the delta log (CandidateData) regardless of when that data was created.
@@ -960,24 +993,102 @@ class PersistCollection(LocalCollection):
             if not self.store_mgr:
                 raise RuntimeError("Store manager is not initialized")
             delta_list = self.store_mgr.get_delta_data_after_ts(newest_version)
+            logger.info(
+                "Index '%s': replaying %d delta records to recover from last persistent snapshot",
+                index_name,
+                len(delta_list),
+            )
             upsert_list: List[DeltaRecord] = []
             delete_list: List[DeltaRecord] = []
+            _processed = 0
+            _last_log = 0.0
             for data in delta_list:
                 if data.type == OpType.PUT.value:
                     if delete_list:
-                        index.delete_data(delete_list)
+                        _processed += self._replay_recovery_records(
+                            index_name=index_name,
+                            index=index,
+                            records=delete_list,
+                            operation="delete",
+                        )
                         delete_list = []
                     upsert_list.append(data)
                 elif data.type == OpType.DEL.value:
                     if upsert_list:
-                        index.upsert_data(upsert_list)
+                        _processed += self._replay_recovery_records(
+                            index_name=index_name,
+                            index=index,
+                            records=upsert_list,
+                            operation="upsert",
+                        )
                         upsert_list = []
                     delete_list.append(data)
+                now = time.time()
+                if now - _last_log >= 5.0 and _processed > 0:
+                    logger.info(
+                        "Delta replay progress: %d/%d records for index '%s'",
+                        _processed,
+                        len(delta_list),
+                        index_name,
+                    )
+                    _last_log = now
             if upsert_list:
-                index.upsert_data(upsert_list)
+                _processed += self._replay_recovery_records(
+                    index_name=index_name,
+                    index=index,
+                    records=upsert_list,
+                    operation="upsert",
+                )
             if delete_list:
-                index.delete_data(delete_list)
+                _processed += self._replay_recovery_records(
+                    index_name=index_name,
+                    index=index,
+                    records=delete_list,
+                    operation="delete",
+                )
+            logger.info("Index '%s': replay complete (%d records)", index_name, _processed)
             self.indexes.set(index_name, index)
+
+    def _replay_recovery_records(
+        self,
+        *,
+        index_name: str,
+        index: PersistentIndex,
+        records: List[DeltaRecord],
+        operation: str,
+    ) -> int:
+        if not records:
+            return 0
+
+        replay = index.upsert_data if operation == "upsert" else index.delete_data
+        try:
+            replay(records)
+            return len(records)
+        except Exception as exc:
+            logger.warning(
+                "Index '%s': failed to replay %d %s delta records as a batch: %s; "
+                "retrying individually",
+                index_name,
+                len(records),
+                operation,
+                exc,
+            )
+
+        processed = 0
+        for record in records:
+            try:
+                replay([record])
+                processed += 1
+            except Exception as exc:
+                logger.warning(
+                    "Index '%s': skipping corrupt %s delta record label=%s type=%s: %s",
+                    index_name,
+                    operation,
+                    getattr(record, "label", None),
+                    getattr(record, "type", None),
+                    exc,
+                )
+        return processed
 
     def _persist_all_indexes(self):
         """Persist all indexes.
@@ -1021,9 +1132,9 @@ class PersistCollection(LocalCollection):
         cands_list: List[CandidateData],
         force_rebuild: bool = False,
     ):
-        new_index_dir = os.path.join(self.index_dir, index_name)
+        new_index_dir = str(safe_join_name(self.index_dir, index_name))
         os.makedirs(new_index_dir, exist_ok=True)
-        meta_path = os.path.join(new_index_dir, "index_meta.json")
+        meta_path = str(safe_join(new_index_dir, "index_meta.json"))
         meta = create_index_meta(self.meta, meta_path, meta_data)
         index = PersistentIndex(
             name=index_name,

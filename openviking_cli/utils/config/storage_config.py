@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -14,6 +14,15 @@ from .vectordb_config import VectorDBBackendConfig
 logger = get_logger(__name__)
 
 
+class TaskTrackerConfig(BaseModel):
+    """Configuration for async task tracking backend."""
+
+    backend: Literal["memory", "persistent"] = Field(
+        default="memory",
+        description="Task tracker backend. 'persistent' enables cross-instance task lookup.",
+    )
+
+
 class StorageConfig(BaseModel):
     """Configuration for storage backend.
 
@@ -24,16 +33,21 @@ class StorageConfig(BaseModel):
 
     workspace: str = Field(default="./data", description="Local data storage path (primary)")
 
-    agfs: AGFSConfig = Field(default_factory=lambda: AGFSConfig(), description="AGFS configuration")
+    agfs: AGFSConfig = Field(default_factory=AGFSConfig, description="AGFS configuration")
 
     transaction: TransactionConfig = Field(
-        default_factory=lambda: TransactionConfig(),
+        default_factory=TransactionConfig,
         description="Transaction mechanism configuration",
     )
 
     vectordb: VectorDBBackendConfig = Field(
-        default_factory=lambda: VectorDBBackendConfig(),
+        default_factory=VectorDBBackendConfig,
         description="VectorDB backend configuration",
+    )
+
+    task_tracker: TaskTrackerConfig = Field(
+        default_factory=TaskTrackerConfig,
+        description="Task tracker backend configuration",
     )
 
     params: Dict[str, Any] = Field(
@@ -75,3 +89,12 @@ class StorageConfig(BaseModel):
         upload_temp_dir = workspace_path / "temp" / "upload"
         upload_temp_dir.mkdir(parents=True, exist_ok=True)
         return upload_temp_dir
+
+    def build_task_tracker(self, agfs: Any):
+        """Build a TaskTracker from storage config."""
+        from openviking.service.task_store import PersistentTaskStore
+        from openviking.service.task_tracker import TaskTracker
+
+        if self.task_tracker.backend == "memory":
+            return TaskTracker()
+        return TaskTracker(store=PersistentTaskStore(agfs))

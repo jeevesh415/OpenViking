@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any, Dict, List, Optional
 
+from openviking.core.namespace import canonicalize_uri, visible_roots
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.expr import And, Eq, FilterExpr, In, Or, PathScope, RawDSL
 from openviking.storage.vectordb.collection.collection import Collection
@@ -41,7 +43,8 @@ MEMORY_DEDUP_OUTPUT_FIELDS = [
     "active_count",
     "level",
     "account_id",
-    "owner_space",
+    "owner_user_id",
+    "owner_agent_id",
 ]
 
 FETCH_BY_URI_OUTPUT_FIELDS = [
@@ -57,7 +60,8 @@ FETCH_BY_URI_OUTPUT_FIELDS = [
     "tags",
     "abstract",
     "account_id",
-    "owner_space",
+    "owner_user_id",
+    "owner_agent_id",
 ]
 
 URI_REWRITE_OUTPUT_FIELDS = [
@@ -75,7 +79,8 @@ URI_REWRITE_OUTPUT_FIELDS = [
     "tags",
     "abstract",
     "account_id",
-    "owner_space",
+    "owner_user_id",
+    "owner_agent_id",
 ]
 
 
@@ -189,7 +194,9 @@ class _SingleAccountBackend:
             return False
 
     async def collection_exists(self) -> bool:
-        return self._adapter.collection_exists()
+        # Some adapters perform blocking HTTP requests (for example via
+        # requests), so move the existence check off the event loop.
+        return await asyncio.to_thread(self._adapter.collection_exists)
 
     async def get_collection_info(self) -> Optional[Dict[str, Any]]:
         if not await self.collection_exists():
@@ -249,7 +256,7 @@ class _SingleAccountBackend:
 
     async def get(self, ids: List[str]) -> List[Dict[str, Any]]:
         try:
-            records = self._adapter.get(ids)
+            records = await asyncio.to_thread(self._adapter.get, ids)
             if self._bound_account_id:
                 records = [r for r in records if r.get("account_id") == self._bound_account_id]
             return records
@@ -326,7 +333,8 @@ class _SingleAccountBackend:
                     f"[_SingleAccountBackend.query] Applied account filter, final filter={filter}"
                 )
 
-            return self._adapter.query(
+            return await asyncio.to_thread(
+                self._adapter.query,
                 query_vector=query_vector,
                 sparse_query_vector=sparse_query_vector,
                 filter=filter,
@@ -851,9 +859,9 @@ class VikingVectorIndexBackend:
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
         # TODO：Better Alternative to Current Temporary Fix
-        
-        # If parent_uri is already under the requested target_directories, 
-        # adding a redundant scope prefix filter can slow down the backend. 
+
+        # If parent_uri is already under the requested target_directories,
+        # adding a redundant scope prefix filter can slow down the backend.
         # Keep tenant/context filters but skip target_directories in that case.
         effective_target_directories = target_directories
         if target_directories:
@@ -898,10 +906,8 @@ class VikingVectorIndexBackend:
             Eq("level", 2),
             Eq("account_id", ctx.account_id),
         ]
-        if owner_space:
-            conds.append(Eq("owner_space", owner_space))
         if category_uri_prefix:
-            conds.append(In("uri", [category_uri_prefix]))
+            conds.append(PathScope("uri", canonicalize_uri(category_uri_prefix, ctx), depth=-1))
 
         backend = self._get_backend_for_context(ctx)
         return await backend.search(
@@ -920,9 +926,10 @@ class VikingVectorIndexBackend:
         *,
         ctx: RequestContext,
     ) -> List[Dict[str, Any]]:
-        conds: List[FilterExpr] = [PathScope("uri", uri, depth=0), Eq("account_id", ctx.account_id)]
-        if owner_space:
-            conds.append(Eq("owner_space", owner_space))
+        conds: List[FilterExpr] = [
+            PathScope("uri", canonicalize_uri(uri, ctx), depth=0),
+            Eq("account_id", ctx.account_id),
+        ]
         if level is not None:
             conds.append(Eq("level", level))
 
@@ -941,17 +948,11 @@ class VikingVectorIndexBackend:
 
     async def delete_uris(self, ctx: RequestContext, uris: List[str]) -> None:
         for uri in uris:
+            canonical_uri = canonicalize_uri(uri, ctx)
             conds: List[FilterExpr] = [
                 Eq("account_id", ctx.account_id),
-                Or([Eq("uri", uri), In("uri", [f"{uri}/"])]),
+                Or([Eq("uri", canonical_uri), In("uri", [f"{canonical_uri}/"])]),
             ]
-            if ctx.role == Role.USER and uri.startswith(("viking://user/", "viking://agent/")):
-                owner_space = (
-                    ctx.user.user_space_name()
-                    if uri.startswith("viking://user/")
-                    else ctx.user.agent_space_name()
-                )
-                conds.append(Eq("owner_space", owner_space))
 
             backend = self._get_backend_for_context(ctx)
             await backend.delete_by_filter(And(conds))
@@ -965,16 +966,11 @@ class VikingVectorIndexBackend:
     ) -> bool:
         import hashlib
 
-        conds: List[FilterExpr] = [Eq("uri", uri), Eq("account_id", ctx.account_id)]
+        canonical_uri = canonicalize_uri(uri, ctx)
+        canonical_new_uri = canonicalize_uri(new_uri, ctx)
+        conds: List[FilterExpr] = [Eq("uri", canonical_uri), Eq("account_id", ctx.account_id)]
         if levels:
             conds.append(In("level", levels))
-        if ctx.role == Role.USER and uri.startswith(("viking://user/", "viking://agent/")):
-            owner_space = (
-                ctx.user.user_space_name()
-                if uri.startswith("viking://user/")
-                else ctx.user.agent_space_name()
-            )
-            conds.append(Eq("owner_space", owner_space))
 
         records = await self.filter(
             filter=And(conds),
@@ -1003,14 +999,14 @@ class VikingVectorIndexBackend:
             except (TypeError, ValueError):
                 level = 2
 
-            seed_uri = _seed_uri_for_id(new_uri, level)
+            seed_uri = _seed_uri_for_id(canonical_new_uri, level)
             id_seed = f"{ctx.account_id}:{seed_uri}"
             new_id = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
 
             updated = {
                 **record,
                 "id": new_id,
-                "uri": new_uri,
+                "uri": canonical_new_uri,
             }
             if await self.upsert(updated, ctx=ctx):
                 success = True
@@ -1061,7 +1057,7 @@ class VikingVectorIndexBackend:
 
         if target_directories:
             uri_conds = [
-                PathScope("uri", target_dir, depth=-1)
+                PathScope("uri", canonicalize_uri(target_dir, ctx), depth=-1)
                 for target_dir in target_directories
                 if target_dir
             ]
@@ -1084,31 +1080,11 @@ class VikingVectorIndexBackend:
         if ctx.role == Role.ROOT:
             return None
 
-        user_spaces = [ctx.user.user_space_name(), ctx.user.agent_space_name()]
-        resource_spaces = [*user_spaces, ""]
         account_filter = Eq("account_id", ctx.account_id)
-
-        if context_type == "resource":
-            return And([account_filter, In("owner_space", resource_spaces)])
-        if context_type in {"memory", "skill"}:
-            return And([account_filter, In("owner_space", user_spaces)])
-
-        return And(
-            [
-                account_filter,
-                Or(
-                    [
-                        And([Eq("context_type", "resource"), In("owner_space", resource_spaces)]),
-                        And(
-                            [
-                                In("context_type", ["memory", "skill"]),
-                                In("owner_space", user_spaces),
-                            ]
-                        ),
-                    ]
-                ),
-            ]
-        )
+        path_filter = Or([PathScope("uri", root, depth=-1) for root in visible_roots(ctx)])
+        if context_type:
+            return And([account_filter, path_filter])
+        return And([account_filter, path_filter])
 
     @staticmethod
     def _merge_filters(*filters: Optional[FilterExpr]) -> Optional[FilterExpr]:

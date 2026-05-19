@@ -4,10 +4,14 @@
 """Test if config validators work correctly"""
 
 import sys
+from pathlib import Path
 
+import pytest
+
+from openviking.utils.agfs_utils import _generate_plugin_config, mount_agfs_backend
 from openviking_cli.utils.config.agfs_config import AGFSConfig, S3Config
 from openviking_cli.utils.config.embedding_config import EmbeddingConfig, EmbeddingModelConfig
-from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig, VolcengineConfig
 from openviking_cli.utils.config.vlm_config import VLMConfig
 
 
@@ -24,6 +28,40 @@ def test_agfs_validation():
         print(f"   Pass (path={config.path})")
     except ValueError as e:
         print(f"   Fail: {e}")
+
+
+def test_agfs_s3_normalize_encoding_chars_defaults_to_target_set():
+    config = AGFSConfig(
+        backend="s3",
+        s3=S3Config(
+            bucket="my-bucket",
+            region="us-west-1",
+            access_key="fake-access-key-for-testing",
+            secret_key="fake-secret-key-for-testing-12345",
+            endpoint="https://s3.amazonaws.com",
+        ),
+    )
+
+    assert config.s3.normalize_encoding_chars == "?#%+@"
+
+
+def test_agfs_s3_normalize_encoding_chars_is_forwarded_to_ragfs_plugin_config():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="s3",
+        s3=S3Config(
+            bucket="my-bucket",
+            region="us-west-1",
+            access_key="fake-access-key-for-testing",
+            secret_key="fake-secret-key-for-testing-12345",
+            endpoint="https://s3.amazonaws.com",
+            normalize_encoding_chars="?#",
+        ),
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["s3fs"]["config"]["normalize_encoding_chars"] == "?#"
 
     # Test 2: invalid backend
     print("\n2. Test invalid backend...")
@@ -59,6 +97,190 @@ def test_agfs_validation():
         print(f"   Fail: {e}")
 
 
+def test_agfs_queuefs_defaults_to_sqlite_backend():
+    config = AGFSConfig(path="/tmp/ov-test", backend="local")
+
+    assert config.queuefs.mode == "shared"
+    assert config.queuefs.backend == "sqlite"
+    assert config.queuefs.recover_stale_sec == 0
+    assert config.queuefs.busy_timeout_ms == 5000
+
+
+def test_agfs_queuefs_accepts_memory_backend():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        queuefs={"mode": "worker", "backend": "memory"},
+    )
+
+    assert config.queuefs.mode == "worker"
+    assert config.queuefs.backend == "memory"
+
+
+def test_agfs_queuefs_rejects_legacy_process_mode():
+    with pytest.raises(ValueError, match="queuefs mode"):
+        AGFSConfig(
+            path="/tmp/ov-test",
+            backend="local",
+            queuefs={"mode": "process"},
+        )
+
+
+def test_agfs_queuefs_rejects_invalid_backend():
+    with pytest.raises(ValueError, match="queuefs"):
+        AGFSConfig(
+            path="/tmp/ov-test",
+            backend="local",
+            queuefs={"backend": "bogus"},
+        )
+
+
+def test_agfs_queuefs_rejects_negative_timeouts():
+    with pytest.raises(ValueError, match="busy_timeout_ms"):
+        AGFSConfig(
+            path="/tmp/ov-test",
+            backend="local",
+            queuefs={"busy_timeout_ms": -1},
+        )
+
+    with pytest.raises(ValueError, match="recover_stale_sec"):
+        AGFSConfig(
+            path="/tmp/ov-test",
+            backend="local",
+            queuefs={"recover_stale_sec": -1},
+        )
+
+
+def test_generate_plugin_config_uses_queuefs_memory_backend_without_db_path():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        queuefs={"backend": "memory"},
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["queuefs"]["config"]["backend"] == "memory"
+    assert "db_path" not in plugins["queuefs"]["config"]
+
+
+def test_generate_plugin_config_uses_new_queuefs_db_path_over_legacy_field():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        queue_db_path="/tmp/legacy-queue.db",
+        queuefs={"backend": "sqlite", "db_path": "/tmp/new-queue.db"},
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["queuefs"]["config"]["backend"] == "sqlite"
+    assert plugins["queuefs"]["config"]["db_path"] == str(Path("/tmp/new-queue.db").resolve())
+
+
+def test_generate_plugin_config_supports_legacy_queue_db_path():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        queue_db_path="/tmp/legacy-queue.db",
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["queuefs"]["config"]["backend"] == "sqlite"
+    assert plugins["queuefs"]["config"]["db_path"] == str(Path("/tmp/legacy-queue.db").resolve())
+
+
+def test_generate_plugin_config_uses_workspace_default_queue_db_path():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["queuefs"]["config"]["backend"] == "sqlite"
+    assert plugins["queuefs"]["config"]["db_path"] == "/tmp/ov-test/_system/queue/queue.db"
+
+
+def test_generate_plugin_config_forwards_queuefs_runtime_options():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        queuefs={
+            "backend": "sqlite3",
+            "recover_stale_sec": 17,
+            "busy_timeout_ms": 1234,
+        },
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["queuefs"]["config"]["backend"] == "sqlite3"
+    assert plugins["queuefs"]["config"]["recover_stale_sec"] == 17
+    assert plugins["queuefs"]["config"]["busy_timeout_ms"] == 1234
+
+
+def test_generate_plugin_config_ignores_db_paths_in_memory_mode():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        queue_db_path="/tmp/legacy-queue.db",
+        queuefs={"backend": "memory", "db_path": "/tmp/new-queue.db"},
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["queuefs"]["config"]["backend"] == "memory"
+    assert "db_path" not in plugins["queuefs"]["config"]
+
+
+class _FakeMountClient:
+    def __init__(self):
+        self.mount_calls = []
+
+    def mount(self, plugin_name, mount_path, config):
+        self.mount_calls.append((plugin_name, mount_path, config))
+
+    def unmount(self, _mount_path):
+        return None
+
+
+def test_mount_agfs_backend_skips_queue_sqlite_dirs_for_memory_backend(tmp_path):
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        queuefs={"backend": "memory"},
+    )
+    client = _FakeMountClient()
+
+    mount_agfs_backend(client, config)
+
+    assert (tmp_path / "viking").exists()
+    assert not (tmp_path / "_system" / "queue").exists()
+    queuefs_mount = next(call for call in client.mount_calls if call[0] == "queuefs")
+    assert queuefs_mount[2]["backend"] == "memory"
+    assert "db_path" not in queuefs_mount[2]
+
+
+def test_mount_agfs_backend_creates_queue_sqlite_dirs_for_sqlite_backend(tmp_path):
+    queue_db_path = tmp_path / "custom-queue" / "queue.db"
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        queuefs={"backend": "sqlite", "db_path": str(queue_db_path)},
+    )
+    client = _FakeMountClient()
+
+    mount_agfs_backend(client, config)
+
+    assert (tmp_path / "viking").exists()
+    assert queue_db_path.parent.exists()
+    queuefs_mount = next(call for call in client.mount_calls if call[0] == "queuefs")
+    assert queuefs_mount[2]["backend"] == "sqlite"
+    assert queuefs_mount[2]["db_path"] == str(queue_db_path.resolve())
+
+
 def test_vectordb_validation():
     """Test VectorDB config validation"""
     print("\n" + "=" * 60)
@@ -86,11 +308,72 @@ def test_vectordb_validation():
     try:
         _ = VectorDBBackendConfig(
             backend="volcengine",
-            volcengine={"ak": "test_ak", "sk": "test_sk", "region": "cn-beijing"},
+            volcengine=VolcengineConfig(ak="test_ak", sk="test_sk", region="cn-beijing"),
         )
         print("   Pass")
     except ValueError as e:
         print(f"   Fail: {e}")
+
+    # Test 4: volcengine backend with api_key complete config
+    print("\n4. Test volcengine backend with api_key complete config...")
+    try:
+        _ = VectorDBBackendConfig(
+            backend="volcengine",
+            volcengine=VolcengineConfig(
+                api_key="vk-test-token",
+                host="api-vikingdb.vikingdb.cn-beijing.volces.com",
+            ),
+        )
+        print("   Pass")
+    except ValueError as e:
+        print(f"   Fail: {e}")
+
+
+def test_vectordb_volcengine_validation_accepts_api_key_without_ak_sk():
+    config = VectorDBBackendConfig(
+        backend="volcengine",
+        volcengine=VolcengineConfig(
+            api_key="vk-test-token",
+            host="api-vikingdb.vikingdb.cn-beijing.volces.com",
+        ),
+    )
+
+    assert config.backend == "volcengine"
+    assert config.volcengine is not None
+    assert config.volcengine.api_key == "vk-test-token"
+    assert config.volcengine.host == "api-vikingdb.vikingdb.cn-beijing.volces.com"
+
+
+def test_vectordb_volcengine_without_api_key_still_requires_ak_sk():
+    try:
+        VectorDBBackendConfig(
+            backend="volcengine",
+            volcengine=VolcengineConfig(host="api-vikingdb.vikingdb.cn-beijing.volces.com"),
+        )
+        raise AssertionError("Expected ValueError for missing ak/sk")
+    except ValueError as e:
+        assert "ak" in str(e)
+
+
+def test_removed_volcengine_api_key_backend_name_is_rejected():
+    try:
+        VectorDBBackendConfig(
+            backend="volcengine_api_key",
+        )
+        raise AssertionError("Expected ValueError for removed backend name")
+    except ValueError as e:
+        assert "volcengine_api_key" in str(e)
+
+
+def test_vectordb_volcengine_api_key_auth_requires_host_or_region():
+    try:
+        VectorDBBackendConfig(
+            backend="volcengine",
+            volcengine=VolcengineConfig(api_key="vk-test-token"),
+        )
+        raise AssertionError("Expected ValueError for missing host/region in api_key mode")
+    except ValueError as e:
+        assert "host' or 'region" in str(e)
 
 
 def test_vectordb_index_name_defaults_and_overrides():
@@ -111,6 +394,7 @@ def test_embedding_validation():
     print("\n1. Test no embedder config...")
     try:
         config = EmbeddingConfig()
+        assert config.dense is not None
         print(
             f"   Pass (default provider={config.dense.provider}, model={config.dense.model}, dim={config.dimension})"
         )

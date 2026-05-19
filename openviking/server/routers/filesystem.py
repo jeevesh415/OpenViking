@@ -7,9 +7,11 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
+from openviking.core.path_variables import resolve_path_variables
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
 from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
+from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking_cli.exceptions import NotFoundError
@@ -32,6 +34,8 @@ async def ls(
     """List directory contents."""
     service = get_service()
     actual_node_limit = limit if limit is not None else node_limit
+    # Resolve path variables
+    uri = resolve_path_variables(uri)
     try:
         result = await service.fs.ls(
             uri,
@@ -68,6 +72,8 @@ async def tree(
     """Get directory tree."""
     service = get_service()
     actual_node_limit = limit if limit is not None else node_limit
+    # Resolve path variables
+    uri = resolve_path_variables(uri)
     try:
         result = await service.fs.tree(
             uri,
@@ -96,6 +102,8 @@ async def stat(
 ):
     """Get resource status."""
     service = get_service()
+    # Resolve path variables
+    uri = resolve_path_variables(uri)
     try:
         result = await service.fs.stat(uri, ctx=_ctx)
         return Response(status="ok", result=result)
@@ -106,6 +114,11 @@ async def stat(
         err_msg = str(e).lower()
         if "not found" in err_msg or "no such file or directory" in err_msg:
             raise NotFoundError(uri, "file")
+        raise
+    except Exception as exc:
+        mapped = map_exception(exc, resource=uri)
+        if mapped is not None:
+            raise mapped from exc
         raise
 
 
@@ -123,15 +136,17 @@ async def mkdir(
 ):
     """Create directory."""
     service = get_service()
+    # Resolve path variables
+    uri = resolve_path_variables(request.uri)
     try:
-        await service.fs.mkdir(request.uri, ctx=_ctx, description=request.description)
+        await service.fs.mkdir(uri, ctx=_ctx, description=request.description)
     except AGFSClientError as e:
         # Handle common AGFS errors
         err_msg = str(e).lower()
         if "not found" in err_msg or "no such file or directory" in err_msg:
-            raise NotFoundError(request.uri, "file")
+            raise NotFoundError(uri, "file")
         raise
-    return Response(status="ok", result={"uri": request.uri})
+    return Response(status="ok", result={"uri": uri})
 
 
 @router.delete("")
@@ -142,17 +157,27 @@ async def rm(
 ):
     """Remove resource."""
     service = get_service()
+    # Resolve path variables
+    uri = resolve_path_variables(uri)
     try:
-        await service.fs.rm(uri, ctx=_ctx, recursive=recursive)
+        result = await service.fs.rm(uri, ctx=_ctx, recursive=recursive)
     except AGFSNotFoundError:
         raise NotFoundError(uri, "file")
     except AGFSClientError as e:
-        # Fallback for older versions without typed exceptions
         err_msg = str(e).lower()
         if "not found" in err_msg or "no such file or directory" in err_msg:
             raise NotFoundError(uri, "file")
         raise
-    return Response(status="ok", result={"uri": uri})
+    except Exception as exc:
+        mapped = map_exception(exc, resource=uri)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+    # Build response with uri and estimated_deleted_count
+    response_result = {"uri": uri}
+    if isinstance(result, dict) and "estimated_deleted_count" in result:
+        response_result["estimated_deleted_count"] = result["estimated_deleted_count"]
+    return Response(status="ok", result=response_result)
 
 
 class MvRequest(BaseModel):
@@ -169,14 +194,22 @@ async def mv(
 ):
     """Move resource."""
     service = get_service()
+    # Resolve path variables
+    from_uri = resolve_path_variables(request.from_uri)
+    to_uri = resolve_path_variables(request.to_uri)
     try:
-        await service.fs.mv(request.from_uri, request.to_uri, ctx=_ctx)
+        await service.fs.mv(from_uri, to_uri, ctx=_ctx)
     except AGFSNotFoundError:
-        raise NotFoundError(request.from_uri, "file")
+        raise NotFoundError(from_uri, "file")
     except AGFSClientError as e:
         # Fallback for older versions without typed exceptions
         err_msg = str(e).lower()
         if "not found" in err_msg or "no such file or directory" in err_msg:
-            raise NotFoundError(request.from_uri, "file")
+            raise NotFoundError(from_uri, "file")
         raise
-    return Response(status="ok", result={"from": request.from_uri, "to": request.to_uri})
+    except Exception as exc:
+        mapped = map_exception(exc, resource=from_uri)
+        if mapped is not None:
+            raise mapped from exc
+        raise
+    return Response(status="ok", result={"from": from_uri, "to": to_uri})

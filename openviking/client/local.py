@@ -56,15 +56,17 @@ class LocalClient(BaseClient):
     def __init__(
         self,
         path: Optional[str] = None,
+        user: Optional[UserIdentifier] = None,
     ):
         """Initialize LocalClient.
 
         Args:
             path: Local storage path (overrides ov.conf storage path)
+            user: Explicit user/account/agent identity for embedded mode
         """
         self._service = OpenVikingService(
             path=path,
-            user=UserIdentifier.the_default_user(),
+            user=user or UserIdentifier.the_default_user(),
         )
         self._user = self._service.user
         self._ctx = RequestContext(user=self._user, role=Role.USER)
@@ -154,6 +156,19 @@ class LocalClient(BaseClient):
     async def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Wait for all processing to complete."""
         return await self._service.resources.wait_processed(timeout=timeout)
+
+    async def reindex(
+        self,
+        uri: str,
+        mode: str = "vectors_only",
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        """Reindex semantic/vector artifacts for a URI."""
+        return await self._service.reindex(
+            uri=uri,
+            mode=mode,
+            wait=wait,
+        )
 
     async def build_index(self, resource_uris: Union[str, List[str]], **kwargs) -> Dict[str, Any]:
         """Manually trigger index building."""
@@ -275,7 +290,7 @@ class LocalClient(BaseClient):
     async def find(
         self,
         query: str,
-        target_uri: str = "",
+        target_uri: Union[str, List[str]] = "",
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict[str, Any]] = None,
@@ -283,6 +298,7 @@ class LocalClient(BaseClient):
         since: Optional[str] = None,
         until: Optional[str] = None,
         time_field: Optional[str] = None,
+        level: Optional[List[int]] = None,
     ) -> Any:
         """Semantic search without session context."""
         resolved_filter = _resolve_search_filter(filter, since, until, time_field)
@@ -296,6 +312,7 @@ class LocalClient(BaseClient):
                 limit=limit,
                 score_threshold=score_threshold,
                 filter=resolved_filter,
+                level=level,
             ),
         )
         return attach_telemetry_payload(
@@ -306,7 +323,7 @@ class LocalClient(BaseClient):
     async def search(
         self,
         query: str,
-        target_uri: str = "",
+        target_uri: Union[str, List[str]] = "",
         session_id: Optional[str] = None,
         limit: int = 10,
         score_threshold: Optional[float] = None,
@@ -315,6 +332,7 @@ class LocalClient(BaseClient):
         since: Optional[str] = None,
         until: Optional[str] = None,
         time_field: Optional[str] = None,
+        level: Optional[List[int]] = None,
     ) -> Any:
         """Semantic search with optional session context."""
         resolved_filter = _resolve_search_filter(filter, since, until, time_field)
@@ -332,6 +350,7 @@ class LocalClient(BaseClient):
                 limit=limit,
                 score_threshold=score_threshold,
                 filter=resolved_filter,
+                level=level,
             )
 
         execution = await run_with_telemetry(
@@ -384,13 +403,26 @@ class LocalClient(BaseClient):
 
     # ============= Sessions =============
 
-    async def create_session(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+    async def create_session(
+        self, session_id: Optional[str] = None, telemetry: TelemetryRequest = False
+    ) -> Dict[str, Any]:
         """Create a new session.
 
         Args:
             session_id: Optional session ID. If provided, creates a session with the given ID.
                        If None, creates a new session with auto-generated ID.
         """
+        execution = await run_with_telemetry(
+            operation="session.create",
+            telemetry=telemetry,
+            fn=lambda: self._create_session_impl(session_id),
+        )
+        return attach_telemetry_payload(
+            execution.result,
+            execution.telemetry,
+        )
+
+    async def _create_session_impl(self, session_id: Optional[str]) -> Dict[str, Any]:
         await self._service.initialize_user_directories(self._ctx)
         await self._service.initialize_agent_directories(self._ctx)
         session = await self._service.sessions.create(self._ctx, session_id)
@@ -455,6 +487,8 @@ class LocalClient(BaseClient):
         content: Optional[str] = None,
         parts: Optional[List[Dict[str, Any]]] = None,
         created_at: Optional[str] = None,
+        role_id: Optional[str] = None,
+        telemetry: TelemetryRequest = False,
     ) -> Dict[str, Any]:
         """Add a message to a session.
 
@@ -464,13 +498,39 @@ class LocalClient(BaseClient):
             content: Text content (simple mode, backward compatible)
             parts: Parts array (full Part support mode)
             created_at: Message creation time (ISO format string)
+            role_id: Optional explicit actor identity. Omit to derive it from the local context.
 
         If both content and parts are provided, parts takes precedence.
         """
+        execution = await run_with_telemetry(
+            operation="session.add_message",
+            telemetry=telemetry,
+            fn=lambda: self._add_message_impl(
+                session_id,
+                role,
+                content,
+                parts,
+                created_at,
+                role_id,
+            ),
+        )
+        return attach_telemetry_payload(
+            execution.result,
+            execution.telemetry,
+        )
+
+    async def _add_message_impl(
+        self,
+        session_id: str,
+        role: str,
+        content: Optional[str],
+        parts: Optional[List[Dict[str, Any]]],
+        created_at: Optional[str],
+        role_id: Optional[str],
+    ) -> Dict[str, Any]:
         from openviking.message.part import Part, TextPart, part_from_dict
 
-        session = self._service.sessions.session(self._ctx, session_id)
-        await session.load()
+        session = await self._service.sessions.get(session_id, self._ctx, auto_create=True)
 
         message_parts: list[Part]
         if parts is not None:
@@ -480,8 +540,12 @@ class LocalClient(BaseClient):
         else:
             raise ValueError("Either content or parts must be provided")
 
-        # created_at 直接传递给 session (毫秒时间戳)
-        session.add_message(role, message_parts, created_at=created_at)
+        if role_id is None and role == "user":
+            role_id = self._ctx.user.user_id
+        elif role_id is None and role == "assistant":
+            role_id = self._ctx.user.agent_id
+
+        session.add_message(role, message_parts, role_id=role_id, created_at=created_at)
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
@@ -489,23 +553,66 @@ class LocalClient(BaseClient):
 
     # ============= Pack =============
 
-    async def export_ovpack(self, uri: str, to: str) -> str:
+    async def export_ovpack(
+        self,
+        uri: str,
+        to: str,
+        include_vectors: bool = False,
+    ) -> str:
         """Export context as .ovpack file."""
-        return await self._service.pack.export_ovpack(uri, to, ctx=self._ctx)
+        return await self._service.pack.export_ovpack(
+            uri,
+            to,
+            ctx=self._ctx,
+            include_vectors=include_vectors,
+        )
+
+    async def backup_ovpack(self, to: str, include_vectors: bool = False) -> str:
+        """Back up public scopes as a restore-only .ovpack file."""
+        return await self._service.pack.backup_ovpack(
+            to,
+            ctx=self._ctx,
+            include_vectors=include_vectors,
+        )
 
     async def import_ovpack(
         self,
         file_path: str,
         parent: str,
-        force: bool = False,
-        vectorize: bool = True,
+        on_conflict: Optional[str] = None,
+        vector_mode: Optional[str] = None,
     ) -> str:
         """Import .ovpack file."""
         return await self._service.pack.import_ovpack(
-            file_path, parent, ctx=self._ctx, force=force, vectorize=vectorize
+            file_path,
+            parent,
+            ctx=self._ctx,
+            on_conflict=on_conflict,
+            vector_mode=vector_mode,
+        )
+
+    async def restore_ovpack(
+        self,
+        file_path: str,
+        on_conflict: Optional[str] = None,
+        vector_mode: Optional[str] = None,
+    ) -> str:
+        """Restore backup .ovpack file."""
+        return await self._service.pack.restore_ovpack(
+            file_path,
+            ctx=self._ctx,
+            on_conflict=on_conflict,
+            vector_mode=vector_mode,
         )
 
     # ============= Debug =============
+
+    async def check_consistency(self, uri: str) -> Dict[str, Any]:
+        """Check filesystem/vector-index consistency for a URI subtree."""
+        return await self._service.check_consistency(
+            uri=uri,
+            ctx=self._ctx,
+        )
 
     async def health(self) -> bool:
         """Check service health."""
@@ -515,23 +622,20 @@ class LocalClient(BaseClient):
         """Create a new session or load an existing one.
 
         Args:
-            session_id: Session ID, creates a new session if None
-            must_exist: If True and session_id is provided, raises NotFoundError
-                        when the session does not exist.
-                        If session_id is None, must_exist is ignored.
-
+            session_id: Session ID, creates a new session if None.
+            must_exist: Whether to raise an error if the session does not exist. Default False.
         Returns:
-            Session object
-
-        Raises:
-            NotFoundError: If must_exist=True and the session does not exist.
+            Session object if exists, None otherwise.
         """
+
         session = self._service.sessions.session(self._ctx, session_id)
-        if must_exist and session_id:
-            if not run_async(session.exists()):
+        if not run_async(session.exists()):
+            if must_exist and session_id:
                 from openviking_cli.exceptions import NotFoundError
 
                 raise NotFoundError(session_id, "session")
+            else:
+                run_async(session.ensure_exists())
         return session
 
     async def session_exists(self, session_id: str) -> bool:

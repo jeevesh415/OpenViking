@@ -9,7 +9,12 @@ import httpx
 import pytest
 
 from openviking.models.embedder.base import EmbedResult
+from openviking.server.auth import get_request_context
+from openviking.server.identity import RequestContext, Role
+from openviking.storage.viking_fs import VikingFS
 from openviking.utils.time_utils import parse_iso_datetime
+from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.session.user_id import UserIdentifier
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +50,288 @@ async def test_find_with_target_uri(client_with_resource):
     assert resp.json()["status"] == "ok"
 
 
+async def test_find_with_level_passes_to_service(client: httpx.AsyncClient, service, monkeypatch):
+    captured = {}
+
+    async def fake_find(*, level=None, **kwargs):
+        captured["level"] = level
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample", "level": [0, 2]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["level"] == [0, 2]
+
+
+async def test_find_without_level_passes_none(client: httpx.AsyncClient, service, monkeypatch):
+    captured = {}
+
+    async def fake_find(*, level=None, **kwargs):
+        captured["level"] = level
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["level"] is None
+
+
+async def test_find_level_filters_l2_only(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample document", "limit": 10, "level": [2]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    for key in ("memories", "resources", "skills"):
+        for item in result.get(key, []):
+            assert item.get("level") == 2
+
+
+async def test_find_level_filters_l0_only(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample document", "limit": 10, "level": [0]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    for key in ("memories", "resources", "skills"):
+        for item in result.get(key, []):
+            assert item.get("level") == 0
+
+
+async def test_find_level_filters_mixed_l0_l2(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample document", "limit": 10, "level": [0, 2]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    for key in ("memories", "resources", "skills"):
+        for item in result.get(key, []):
+            assert item.get("level") in (0, 2)
+
+
+async def test_find_level_filters_l0_l1(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample document", "limit": 10, "level": [0, 1]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    for key in ("memories", "resources", "skills"):
+        for item in result.get(key, []):
+            assert item.get("level") in (0, 1)
+
+
+async def test_find_level_with_no_matching_results(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample document", "limit": 10, "level": [5]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    assert result.get("total", 0) == 0
+
+
+async def test_search_with_level_passes_to_service(client: httpx.AsyncClient, service, monkeypatch):
+    captured = {}
+
+    async def fake_search(*, level=None, **kwargs):
+        captured["level"] = level
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "search", fake_search)
+
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample", "level": [0, 2]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["level"] == [0, 2]
+
+
+async def test_search_without_level_passes_none(client: httpx.AsyncClient, service, monkeypatch):
+    captured = {}
+
+    async def fake_search(*, level=None, **kwargs):
+        captured["level"] = level
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "search", fake_search)
+
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["level"] is None
+
+
+async def test_search_level_filters_l2_only(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample document", "limit": 10, "level": [2]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    for key in ("memories", "resources", "skills"):
+        for item in result.get(key, []):
+            assert item.get("level") == 2
+
+
+async def test_search_level_filters_l0_only(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample document", "limit": 10, "level": [0]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    for key in ("memories", "resources", "skills"):
+        for item in result.get(key, []):
+            assert item.get("level") == 0
+
+
+async def test_search_level_filters_mixed_l0_l2(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample document", "limit": 10, "level": [0, 2]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    for key in ("memories", "resources", "skills"):
+        for item in result.get(key, []):
+            assert item.get("level") in (0, 2)
+
+
+async def test_search_level_filters_l0_l1(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample document", "limit": 10, "level": [0, 1]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    for key in ("memories", "resources", "skills"):
+        for item in result.get(key, []):
+            assert item.get("level") in (0, 1)
+
+
+async def test_search_level_with_no_matching_results(client_with_resource):
+    client, uri = client_with_resource
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample document", "limit": 10, "level": [5]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    assert result.get("total", 0) == 0
+
+
+async def test_find_with_level_string_input(client: httpx.AsyncClient, service, monkeypatch):
+    captured = {}
+
+    async def fake_find(*, level=None, **kwargs):
+        captured["level"] = level
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample", "level": "0,2"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["level"] == [0, 2]
+
+
+async def test_find_with_level_int_input(client: httpx.AsyncClient, service, monkeypatch):
+    captured = {}
+
+    async def fake_find(*, level=None, **kwargs):
+        captured["level"] = level
+        return {"items": []}
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": "sample", "level": 2},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["level"] == [2]
+
+
+async def test_find_with_inaccessible_target_uri_returns_permission_denied(
+    client: httpx.AsyncClient, app
+):
+    app.dependency_overrides[get_request_context] = lambda: RequestContext(
+        user=UserIdentifier.the_default_user(),
+        role=Role.USER,
+    )
+    try:
+        resp = await client.post(
+            "/api/v1/search/find",
+            json={"query": "sample", "target_uri": "viking://agent/foreign-agent", "limit": 5},
+        )
+    finally:
+        app.dependency_overrides.pop(get_request_context, None)
+
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "PERMISSION_DENIED"
+    assert "Access denied" in body["error"]["message"]
+
+
 async def test_find_with_score_threshold(client_with_resource):
     client, uri = client_with_resource
     resp = await client.post(
@@ -66,6 +353,61 @@ async def test_find_no_results(client: httpx.AsyncClient):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+@pytest.mark.parametrize("query", ["", "   \t\n"])
+async def test_find_rejects_empty_query(client: httpx.AsyncClient, service, query: str):
+    class RaisingEmbedder:
+        def embed(self, text: str, is_query: bool = False) -> EmbedResult:
+            raise AssertionError("empty query should not be embedded")
+
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            raise AssertionError("empty query should not be embedded")
+
+    service.viking_fs.query_embedder = RaisingEmbedder()
+
+    resp = await client.post(
+        "/api/v1/search/find",
+        json={"query": query},
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert "must not be empty" in body["error"]["message"]
+
+
+@pytest.mark.parametrize("query", ["", "   \t\n"])
+async def test_search_rejects_empty_query(client: httpx.AsyncClient, service, query: str):
+    class RaisingEmbedder:
+        def embed(self, text: str, is_query: bool = False) -> EmbedResult:
+            raise AssertionError("empty query should not be embedded")
+
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            raise AssertionError("empty query should not be embedded")
+
+    service.viking_fs.query_embedder = RaisingEmbedder()
+
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": query},
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert "must not be empty" in body["error"]["message"]
+
+
+@pytest.mark.parametrize("method_name", ["find", "search"])
+async def test_vikingfs_rejects_empty_query_before_initialization(method_name: str):
+    viking_fs = VikingFS.__new__(VikingFS)
+    method = getattr(viking_fs, method_name)
+
+    with pytest.raises(InvalidArgumentError, match="must not be empty"):
+        await method(query=" ")
 
 
 async def test_find_with_since_compiles_time_range(client: httpx.AsyncClient, service, monkeypatch):
@@ -128,34 +470,45 @@ async def test_find_combines_existing_filter_with_time_range(
     }
 
 
-async def test_find_with_invalid_time_returns_422(client: httpx.AsyncClient):
+async def test_find_with_invalid_time_returns_invalid_argument(client: httpx.AsyncClient):
     resp = await client.post(
         "/api/v1/search/find",
         json={"query": "sample", "since": "not-a-time"},
     )
 
-    assert resp.status_code == 422
-    assert resp.json()["detail"]
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert body["error"]["message"]
 
 
-async def test_find_with_invalid_time_field_returns_422(client: httpx.AsyncClient):
+async def test_find_with_invalid_time_field_returns_invalid_argument(client: httpx.AsyncClient):
     resp = await client.post(
         "/api/v1/search/find",
         json={"query": "sample", "time_field": "published_at", "since": "2h"},
     )
 
-    assert resp.status_code == 422
-    assert resp.json()["detail"]
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert body["error"]["message"]
 
 
-async def test_find_with_inverted_mixed_time_range_returns_422(client: httpx.AsyncClient):
+async def test_find_with_inverted_mixed_time_range_returns_invalid_argument(
+    client: httpx.AsyncClient,
+):
     resp = await client.post(
         "/api/v1/search/find",
         json={"query": "sample", "since": "2099-01-01", "until": "2h"},
     )
 
-    assert resp.status_code == 422
-    assert "earlier than or equal to" in resp.json()["detail"]
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert "earlier than or equal to" in body["error"]["message"]
 
 
 async def test_search_basic(client_with_resource):
@@ -314,6 +667,62 @@ async def test_grep_case_insensitive(client_with_resource):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+async def test_grep_missing_uri_returns_not_found(client: httpx.AsyncClient):
+    resp = await client.post(
+        "/api/v1/search/grep",
+        json={
+            "uri": "viking://resources/nonexistent_grep_test_xyz",
+            "pattern": "test",
+        },
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["status"] == "error"
+
+
+async def test_grep_level_limit_filters_by_relative_match_path(
+    client: httpx.AsyncClient,
+    upload_temp_dir,
+):
+    root_file = upload_temp_dir / "root_level.md"
+    root_file.write_text("OpenViking on root level\n")
+    deep_file = upload_temp_dir / "deep_level.md"
+    deep_file.write_text("OpenViking in deep level\n")
+
+    await client.post(
+        "/api/v1/resources",
+        json={
+            "temp_file_id": root_file.name,
+            "to": "viking://resources/level-limit/root_level.md",
+            "reason": "test",
+        },
+    )
+    await client.post(
+        "/api/v1/resources",
+        json={
+            "temp_file_id": deep_file.name,
+            "to": "viking://resources/level-limit/nested/deeper/deep_level.md",
+            "reason": "test",
+        },
+    )
+
+    resp = await client.post(
+        "/api/v1/search/grep",
+        json={
+            "uri": "viking://resources/level-limit",
+            "pattern": "OpenViking",
+            "level_limit": 2,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    uris = {m["uri"] for m in body["result"]["matches"]}
+    assert "viking://resources/level-limit/root_level.md/root_level.md" in uris
+    assert "viking://resources/level-limit/nested/deeper/deep_level.md/deep_level.md" not in uris
 
 
 async def test_grep_exclude_uri_excludes_specific_uri_range(

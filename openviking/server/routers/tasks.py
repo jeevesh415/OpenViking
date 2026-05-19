@@ -9,12 +9,13 @@ endpoints to check completion, results, or errors.
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.service.task_tracker import get_task_tracker
+from openviking_cli.exceptions import OpenVikingError
 
 router = APIRouter(prefix="/api/v1", tags=["tasks"])
 
@@ -28,11 +29,15 @@ async def get_task(
     tracker = get_task_tracker()
     task = tracker.get(
         task_id,
-        owner_account_id=_ctx.account_id,
-        owner_user_id=_ctx.user.user_id,
+        account_id=_ctx.account_id,
+        user_id=_ctx.user.user_id,
     )
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found or expired")
+        raise OpenVikingError(
+            "Task not found or expired",
+            code="NOT_FOUND",
+            details={"resource": task_id, "type": "task"},
+        )
     return Response(status="ok", result=task.to_dict())
 
 
@@ -53,7 +58,7 @@ async def list_tasks(
         status=status,
         resource_id=resource_id,
         limit=limit,
-        owner_account_id=_ctx.account_id,
-        owner_user_id=_ctx.user.user_id,
+        account_id=_ctx.account_id,
+        user_id=_ctx.user.user_id,
     )
     return Response(status="ok", result=[t.to_dict() for t in tasks])

@@ -4,10 +4,10 @@ Command-line interface for [OpenViking](https://github.com/volcengine/OpenViking
 
 ## Installation
 
-### Quick Install (Linux/macOS)
+### Install from npm (macOS/Linux/Windows)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/crates/ov_cli/install.sh | bash
+npm i -g @openviking/cli
 ```
 
 ### From Source
@@ -32,7 +32,7 @@ Create `~/.openviking/ovcli.conf`:
 }
 ```
 
-`account` and `user` are optional with a regular user key because the server can derive them from the key. They are recommended when you use `trusted` auth mode or a root key against tenant-scoped APIs.
+`role` defaults to `user` and only applies in `trusted` mode. In `api_key` mode the server ignores it and derives the effective role from the API key. `account` and `user` are optional with a regular user key because the server can derive them from the key. They are recommended when you use `trusted` auth mode or a root key against tenant-scoped APIs.
 
 ## Quick Start
 
